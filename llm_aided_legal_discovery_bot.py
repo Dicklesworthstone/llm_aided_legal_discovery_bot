@@ -18,7 +18,7 @@ import numpy as np
 import hashlib
 from collections import Counter
 import urllib.request
-import logging
+import picologging as logging
 import warnings
 import email
 from email.parser import BytesParser
@@ -551,6 +551,7 @@ async def process_document_ocr(list_of_extracted_text_strings: List[str], reform
     logging.info(f"Starting OCR document processing. Total pages: {len(list_of_extracted_text_strings):,}")
     full_text = "\n\n".join(list_of_extracted_text_strings)
     logging.info(f"Size of full OCR text before processing: {len(full_text):,} characters")
+    
     chunk_size, overlap = 8000, 10
     # Improved chunking logic
     paragraphs = re.split(r'\n\s*\n', full_text)
@@ -592,19 +593,21 @@ async def process_document_ocr(list_of_extracted_text_strings: List[str], reform
     processed_chunks = []
     for i, chunk in enumerate(chunks):
         try:
+            logging.info(f"Processing chunk {i+1}/{len(chunks)}")
             processed_chunk = await process_chunk_ocr(chunk, "", i, len(chunks), reformat_as_markdown, suppress_headers_and_page_numbers)
             processed_chunks.append(processed_chunk[0])  # process_chunk_ocr returns a tuple, we want the first element
+            logging.info(f"Chunk {i+1}/{len(chunks)} processed successfully")
         except Exception as e:
             logging.error(f"Error processing chunk {i+1}/{len(chunks)}: {str(e)}")
             logging.error(traceback.format_exc())
             # Append original chunk if processing fails
             processed_chunks.append(chunk)
+            logging.warning(f"Using original chunk for {i+1}/{len(chunks)} due to processing error")
     
     final_text = "".join(processed_chunks)
     logging.info(f"Size of OCR text after combining chunks: {len(final_text):,} characters")
     logging.info(f"OCR document processing complete. Final text length: {len(final_text):,} characters")
     return final_text
-
 
 ##########################################################################
 # Prompt Templates
@@ -1902,39 +1905,48 @@ async def convert_documents_to_plaintext(original_source_dir: str, converted_sou
     os.makedirs(converted_source_dir, exist_ok=True)
     semaphore = asyncio.Semaphore(MAX_SOURCE_DOCUMENTS_TO_CONVERT_TO_PLAINTEXT_AT_ONE_TIME)
 
-    async def process_file(file_name: str):
+    async def process_file(file_name: str, pbar: tqdm):
         async with semaphore:
             source_file_path = os.path.join(original_source_dir, file_name)
             if not os.path.isfile(source_file_path):
-                logging.warning(f"Skipping {file_name} as it's not a file")
+                pbar.set_postfix_str(f"Skipped {file_name} (not a file)")
+                pbar.update(1)
                 return
 
             base_name = os.path.splitext(file_name)[0]
             converted_file_path = os.path.join(converted_source_dir, f"{base_name}.txt")
 
-            logging.info(f"Starting conversion of {file_name}")
             try:
+                pbar.set_postfix_str(f"Processing {file_name}")
                 processed_text, mime_type, metadata, used_smart_ocr = await preprocess_document(source_file_path)
                 
                 if not processed_text.strip():
-                    logging.warning(f"No text extracted from {file_name}. Skipping.")
+                    pbar.set_postfix_str(f"No text extracted from {file_name}")
+                    pbar.update(1)
                     return
+                
                 if used_smart_ocr:
-                    logging.info(f"Smart OCR used for {file_name}. Saving output with markdown file extension.")
                     converted_file_path = converted_file_path.replace('.txt', '.md')
+                
                 with open(converted_file_path, 'w', encoding='utf-8') as f:
                     f.write(processed_text)
-                logging.info(f"Successfully converted {file_name} to plaintext and saved to {converted_file_path}")
+                
+                pbar.set_postfix_str(f"Converted {file_name} ({mime_type})")
+                pbar.update(1)
 
             except Exception as e:
+                pbar.set_postfix_str(f"Error converting {file_name}: {str(e)}")
+                pbar.update(1)
                 logging.error(f"Error converting {file_name}: {str(e)}")
                 logging.error(traceback.format_exc())
 
-    # Process files concurrently
     file_names = os.listdir(original_source_dir)
     logging.info(f"Found {len(file_names)} files to process in {original_source_dir}")
-    tasks = [process_file(file_name) for file_name in file_names]
-    await asyncio.gather(*tasks)
+
+    with tqdm(total=len(file_names), desc="Converting documents", unit="file") as pbar:
+        tasks = [process_file(file_name, pbar) for file_name in file_names]
+        await asyncio.gather(*tasks)
+
     logging.info("Completed conversion of all documents to plaintext")
 
     # Check for and remove tiny text files

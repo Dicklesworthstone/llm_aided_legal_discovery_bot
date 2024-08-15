@@ -12,6 +12,7 @@ nvgpu
 openai
 opencv-python-headless
 pdf2image
+picologging
 pillow
 PyPDF2
 pytesseract
