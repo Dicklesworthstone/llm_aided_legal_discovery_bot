@@ -379,10 +379,59 @@ def ocr_image(image):
     preprocessed_image = preprocess_image_ocr(image)
     return pytesseract.image_to_string(preprocessed_image)
 
+def escape_special_characters(text):
+    return text.replace('{', '{{').replace('}', '}}')
+
 async def process_chunk_ocr(chunk: str, prev_context: str, chunk_index: int, total_chunks: int, reformat_as_markdown: bool, suppress_headers_and_page_numbers: bool) -> Tuple[str, str]:
     logging.info(f"Processing OCR chunk {chunk_index + 1}/{total_chunks} (length: {len(chunk):,} characters)")
     
-    ocr_correction_prompt = f"""Correct OCR-induced errors in the text, ensuring it flows coherently with the previous context. Follow these guidelines:
+    # Check if the chunk has enough content
+    if len(chunk.strip()) < 50:
+        logging.warning(f"Skipping chunk {chunk_index + 1}/{total_chunks} due to insufficient content (less than 50 characters)")
+        return "", prev_context
+    
+    # Reduce context size
+    context_length = min(250, len(prev_context))
+    prev_context_short = prev_context[-context_length:]
+    
+    # Function to process text in smaller parts
+    async def process_text(text: str, prompt_template: str, max_chunk_size: int = 1000) -> str:
+        text = escape_special_characters(text)
+        model_name = OPENAI_COMPLETION_MODEL if API_PROVIDER == "OPENAI" else CLAUDE_MODEL_STRING
+        if estimate_tokens(text, model_name) <= max_chunk_size:
+            prompt = prompt_template.format(text=text, prev_context=prev_context_short)
+            max_tokens = min(2048, 4096 - estimate_tokens(prompt, model_name))
+            return await generate_completion(prompt, max_tokens=max_tokens)
+        
+        parts = []
+        words = text.split()
+        current_part = []
+        current_tokens = 0
+        for word in words:
+            word_tokens = estimate_tokens(word, model_name)
+            if current_tokens + word_tokens > max_chunk_size:
+                part_text = " ".join(current_part)
+                prompt = prompt_template.format(text=part_text, prev_context=prev_context_short)
+                max_tokens = min(2048, 4096 - estimate_tokens(prompt, model_name))
+                processed_part = await generate_completion(prompt, max_tokens=max_tokens)
+                parts.append(processed_part)
+                current_part = [word]
+                current_tokens = word_tokens
+            else:
+                current_part.append(word)
+                current_tokens += word_tokens
+        
+        if current_part:
+            part_text = " ".join(current_part)
+            prompt = prompt_template.format(text=part_text, prev_context=prev_context_short)
+            max_tokens = min(2048, 4096 - estimate_tokens(prompt, model_name))
+            processed_part = await generate_completion(prompt, max_tokens=max_tokens)
+            parts.append(processed_part)
+        
+        return " ".join(parts)
+    
+    # OCR correction prompt template
+    ocr_correction_template = """Correct OCR-induced errors in the text, ensuring it flows coherently with the previous context. Follow these guidelines:
 
 1. Fix OCR-induced typos and errors:
    - Correct words split across line breaks
@@ -407,20 +456,20 @@ async def process_chunk_ocr(chunk: str, prev_context: str, chunk_index: int, tot
 IMPORTANT: Respond ONLY with the corrected text. Preserve all original formatting, including line breaks. Do not include any introduction, explanation, or metadata.
 
 Previous context:
-{prev_context[-500:]}
+{prev_context}
 
-Current chunk to process:
-{chunk}
+Current text to process:
+{text}
 
 Corrected text:
 """
     
-    ocr_corrected_chunk = await generate_completion(ocr_correction_prompt, max_tokens=len(chunk) + 500)
+    ocr_corrected_chunk = await process_text(chunk, ocr_correction_template)
     
     processed_chunk = ocr_corrected_chunk
 
     if reformat_as_markdown:
-        markdown_prompt = f"""Reformat the following text as markdown, improving readability while preserving the original structure. Follow these guidelines:
+        markdown_template = """Reformat the following text as markdown, improving readability while preserving the original structure. Follow these guidelines:
 1. Preserve all original headings, converting them to appropriate markdown heading levels (# for main titles, ## for subtitles, etc.)
    - Ensure each heading is on its own line
    - Add a blank line before and after each heading
@@ -429,29 +478,61 @@ Corrected text:
 4. Use emphasis (*italic*) and strong emphasis (**bold**) where appropriate, based on the original formatting
 5. Preserve all original content and meaning
 6. Do not add any extra punctuation or modify the existing punctuation
-7. Remove any spuriously inserted introductory text such as "Here is the corrected text:" that may have been added by the LLM and which is obviously not part of the original text.
+7. Do not add any introductory text, preamble, or markdown code block indicators
 8. Remove any obviously duplicated content that appears to have been accidentally included twice. Follow these strict guidelines:
-   - Remove only exact or near-exact repeated paragraphs or sections within the main chunk.
-   - Consider the context (before and after the main chunk) to identify duplicates that span chunk boundaries.
-   - Do not remove content that is simply similar but conveys different information.
-   - Preserve all unique content, even if it seems redundant.
-   - Ensure the text flows smoothly after removal.
-   - Do not add any new content or explanations.
-   - If no obvious duplicates are found, return the main chunk unchanged.
-9. {"Identify but do not remove headers, footers, or page numbers. Instead, format them distinctly, e.g., as blockquotes." if not suppress_headers_and_page_numbers else "Carefully remove headers, footers, and page numbers while preserving all other content."}
+   - Remove only exact or near-exact repeated paragraphs or sections within the main chunk
+   - Consider the context (before and after the main chunk) to identify duplicates that span chunk boundaries
+   - Do not remove content that is simply similar but conveys different information
+   - Preserve all unique content, even if it seems redundant
+   - Ensure the text flows smoothly after removal
+   - Do not add any new content or explanations
+   - If no obvious duplicates are found, return the main chunk unchanged
+9. {suppress_instruction}
+
+IMPORTANT: Do not add any markdown code block indicators, preamble, or introductory text. Start directly with the reformatted content.
 
 Text to reformat:
 
-{ocr_corrected_chunk}
+{text}
 
 Reformatted markdown:
 """
-        processed_chunk = await generate_completion(markdown_prompt, max_tokens=len(ocr_corrected_chunk) + 500)
-    new_context = processed_chunk[-1000:]  # Use the last 1000 characters as context for the next chunk
-    logging.info(f"OCR Chunk {chunk_index + 1}/{total_chunks} processed. Output length: {len(processed_chunk):,} characters")
-    return processed_chunk, new_context
+        suppress_instruction = "Carefully remove headers, footers, and page numbers while preserving all other content." if suppress_headers_and_page_numbers else "Identify but do not remove headers, footers, or page numbers. Instead, format them distinctly, e.g., as blockquotes."
+        processed_chunk = await process_text(ocr_corrected_chunk, markdown_template.format(text=ocr_corrected_chunk, suppress_instruction=suppress_instruction))
 
-async def process_chunks_ocr(chunks: List[str], reformat_as_markdown: bool, suppress_headers_and_page_numbers: bool) -> List[str]:
+    # Additional filtering stage
+    filtering_template = """Review the following markdown-formatted text and remove any invalid or unwanted elements without altering the actual content. Follow these guidelines:
+
+1. Remove any markdown code block indicators (```) if present
+2. Remove any preamble or introductory text such as "Reformatted markdown:" or "Here is the corrected text:"
+3. Ensure the text starts directly with the content (e.g., headings, paragraphs, or lists)
+4. Do not remove any actual content, headings, or meaningful text
+5. Preserve all markdown formatting (headings, lists, emphasis, etc.)
+6. Remove any trailing whitespace or unnecessary blank lines at the end of the text
+
+IMPORTANT: Only remove invalid elements as described above. Do not alter, summarize, or remove any of the actual content.
+
+Text to filter:
+
+{text}
+
+Filtered text:
+"""
+    filtered_chunk = await process_text(processed_chunk, filtering_template)
+
+    # Check if the final output is reasonably long
+    if len(filtered_chunk.strip()) < 100:
+        logging.warning(f"Chunk {chunk_index + 1}/{total_chunks} output is too short (less than 100 characters). This may indicate a processing issue.")
+        return "", prev_context
+
+    # Use dynamic context length for the next chunk
+    new_context_length = min(500, len(filtered_chunk))
+    new_context = filtered_chunk[-new_context_length:]
+
+    logging.info(f"OCR Chunk {chunk_index + 1}/{total_chunks} processed. Output length: {len(filtered_chunk):,} characters")
+    return filtered_chunk, new_context
+
+async def process_chunks_ocr(chunks: List[str], reformat_as_markdown: bool = True, suppress_headers_and_page_numbers: bool = True) -> List[str]:
     total_chunks = len(chunks)
     async def process_chunk_with_context(chunk: str, prev_context: str, index: int) -> Tuple[int, str, str]:
         processed_chunk, new_context = await process_chunk_ocr(chunk, prev_context, index, total_chunks, reformat_as_markdown, suppress_headers_and_page_numbers)
@@ -482,8 +563,7 @@ async def process_document_ocr(list_of_extracted_text_strings: List[str], reform
             current_chunk.append(paragraph)
             current_chunk_length += paragraph_length
         else:
-            # If adding the whole paragraph exceeds the chunk size,
-            # we need to split the paragraph into sentences
+            # If adding the whole paragraph exceeds the chunk size, we need to split the paragraph into sentences
             if current_chunk:
                 chunks.append("\n\n".join(current_chunk))
             sentences = re.split(r'(?<=[.!?])\s+', paragraph)
@@ -507,12 +587,23 @@ async def process_document_ocr(list_of_extracted_text_strings: List[str], reform
         overlap_text = chunks[i-1].split()[-overlap:]
         chunks[i] = " ".join(overlap_text) + " " + chunks[i]
     logging.info(f"OCR document split into {len(chunks):,} chunks. Chunk size: {chunk_size:,}, Overlap: {overlap:,}")
-    processed_chunks = await process_chunks_ocr(chunks, reformat_as_markdown, suppress_headers_and_page_numbers)
+    
+    # Process chunks with error handling
+    processed_chunks = []
+    for i, chunk in enumerate(chunks):
+        try:
+            processed_chunk = await process_chunk_ocr(chunk, "", i, len(chunks), reformat_as_markdown, suppress_headers_and_page_numbers)
+            processed_chunks.append(processed_chunk[0])  # process_chunk_ocr returns a tuple, we want the first element
+        except Exception as e:
+            logging.error(f"Error processing chunk {i+1}/{len(chunks)}: {str(e)}")
+            logging.error(traceback.format_exc())
+            # Append original chunk if processing fails
+            processed_chunks.append(chunk)
+    
     final_text = "".join(processed_chunks)
     logging.info(f"Size of OCR text after combining chunks: {len(final_text):,} characters")
     logging.info(f"OCR document processing complete. Final text length: {len(final_text):,} characters")
     return final_text
-
 
 
 ##########################################################################
@@ -1059,18 +1150,20 @@ async def generate_completion_from_openai(prompt: str, max_tokens: int = 5000) -
         logging.error("OpenAI API key not found. Please set the OPENAI_API_KEY environment variable.")
         return None
     prompt_tokens = estimate_tokens(prompt, OPENAI_COMPLETION_MODEL)
-    adjusted_max_tokens = min(max_tokens, 4096 - prompt_tokens - TOKEN_BUFFER)
-    if adjusted_max_tokens <= 0:
+    adjusted_max_tokens = calculate_safe_max_tokens(prompt_tokens, OPENAI_MAX_TOKENS)
+    if adjusted_max_tokens <= 1:
         logging.warning("Prompt is too long for OpenAI API. Chunking the input.")
         chunks = chunk_text(prompt, OPENAI_MAX_TOKENS - TOKEN_CUSHION, OPENAI_COMPLETION_MODEL) 
         results = []
         for chunk in chunks:
             try:
+                chunk_tokens = estimate_tokens(chunk, OPENAI_COMPLETION_MODEL)
+                chunk_max_tokens = calculate_safe_max_tokens(chunk_tokens, OPENAI_MAX_TOKENS)
                 response = await api_request_with_retry(
                     openai_client.chat.completions.create,
                     model=OPENAI_COMPLETION_MODEL,
                     messages=[{"role": "user", "content": chunk}],
-                    max_tokens=adjusted_max_tokens,
+                    max_tokens=chunk_max_tokens,
                     temperature=0.7,
                 )
                 result = response.choices[0].message.content
@@ -1099,7 +1192,7 @@ async def generate_completion_from_openai(prompt: str, max_tokens: int = 5000) -
         except Exception as e:
             logging.error(f"An unexpected error occurred while requesting from OpenAI API: {str(e)}")
         return None
-
+    
 async def generate_completion_from_local_llm(llm_model_name: str, input_prompt: str, number_of_tokens_to_generate: int = 100, temperature: float = 0.7, grammar_file_string: str = None):
     logging.info(f"Starting text completion using model: '{llm_model_name}' for input prompt: '{input_prompt}'")
     llm = load_model(llm_model_name)
@@ -1157,7 +1250,6 @@ async def generate_completion_from_local_llm(llm_model_name: str, input_prompt: 
         }
 
 def calculate_safe_max_tokens(input_length: int, model_max_tokens: int, token_buffer: int = 500) -> int:
-    """Calculate a safe max_tokens value that won't exceed the model's limit."""
     available_tokens = max(0, model_max_tokens - input_length - token_buffer)
     safe_max = min(available_tokens, model_max_tokens // 2, 4096)  # Ensure we don't exceed OpenAI's max limit
     return max(1, safe_max)  # Ensure we always return at least 1 token
@@ -1516,15 +1608,8 @@ async def process_document_for_discovery(file_path: str, discovery_params: Dict[
     document_id = hashlib.sha256(file_content).hexdigest()
 
     try:
-        if file_path.lower().endswith('.pdf') and needs_ocr(file_path):
-            logging.info(f"OCR needed for {file_path}")
-            images = convert_pdf_to_images_ocr(file_path)
-            with ThreadPoolExecutor() as executor:
-                list_of_extracted_text_strings = list(executor.map(ocr_image, images))
-            content = "\n\n".join(list_of_extracted_text_strings)
-            sentences = sophisticated_sentence_splitter(content)
-        else:
-            sentences, _, email_metadata = await parse_document_into_sentences(file_path, detected_mime_type)
+        processed_text, _, metadata, _ = await preprocess_document(file_path)
+        sentences = sophisticated_sentence_splitter(processed_text)
     except ValueError as e:
         logging.error(f"Error parsing document {file_path}: {str(e)}")
         return None
@@ -1537,7 +1622,9 @@ async def process_document_for_discovery(file_path: str, discovery_params: Dict[
             chunk_text = " ".join(chunk)
             return await process_chunk_multi_stage(chunk_text, i, len(chunks), discovery_params)
 
-    chunk_results = await asyncio.gather(*[process_chunk(chunk, i) for i, chunk in enumerate(chunks)])
+    with ThreadPoolExecutor() as executor:
+        loop = asyncio.get_event_loop()
+        chunk_results = await asyncio.gather(*[loop.run_in_executor(executor, lambda: asyncio.run(process_chunk(chunk, i))) for i, chunk in enumerate(chunks)])
     
     processed_chunks = []
     low_importance_chunks = []
@@ -1574,8 +1661,8 @@ async def process_document_for_discovery(file_path: str, discovery_params: Dict[
     }
 
     # Add email metadata if the file is an email
-    if 'email_metadata' in locals() and email_metadata:
-        result['metadata'].update(email_metadata)
+    if metadata:
+        result['metadata'].update(metadata)
 
     return result
 
@@ -1774,6 +1861,42 @@ def load_processed_files(save_path: str) -> Dict[str, str]:
             return json.load(f)
     return {}
 
+async def preprocess_document(file_path: str) -> Tuple[str, str, Dict[str, Any]]:
+    with open(file_path, 'rb') as file:
+        file_content = file.read()
+        result = magika.identify_bytes(file_content)
+        detected_mime_type = result.output.mime_type
+    
+    logging.info(f"Detected MIME type for {file_path}: {detected_mime_type}")
+    
+    metadata = {}
+    used_smart_ocr = False
+    if detected_mime_type.startswith('application/pdf') and robust_needs_ocr(file_path):
+        logging.info(f"PDF {file_path} requires OCR. Starting OCR process...")
+        images = convert_pdf_to_images_ocr(file_path)
+        with ThreadPoolExecutor() as executor:
+            extracted_text_list = list(executor.map(ocr_image, images))
+        extracted_text = await process_document_ocr(extracted_text_list)
+        used_smart_ocr = True
+    elif detected_mime_type.startswith('image/'):
+        logging.info(f"Performing OCR on image {file_path}")
+        extracted_text = perform_simple_ocr_on_image(file_path)
+    elif detected_mime_type == 'message/rfc822':
+        logging.info(f"Processing email file {file_path}")
+        email_content = parse_email(file_path)
+        metadata = email_content['headers']
+        extracted_text = f"From: {metadata['From']}\nTo: {metadata['To']}\nSubject: {metadata['Subject']}\nDate: {metadata['Date']}\n\n{email_content['body']}"
+    else:
+        logging.info(f"Extracting text from {file_path} using textract")
+        extracted_text = textract.process(file_path, encoding='utf-8').decode('utf-8')
+    
+    # Post-processing
+    extracted_text = remove_pagination_breaks(extracted_text)
+    sentences = sophisticated_sentence_splitter(extracted_text)
+    processed_text = "\n".join(sentences)
+    
+    return processed_text, detected_mime_type, metadata, used_smart_ocr
+
 async def convert_documents_to_plaintext(original_source_dir: str, converted_source_dir: str):
     logging.info("Starting conversion of source documents to plaintext")
     os.makedirs(converted_source_dir, exist_ok=True)
@@ -1791,38 +1914,16 @@ async def convert_documents_to_plaintext(original_source_dir: str, converted_sou
 
             logging.info(f"Starting conversion of {file_name}")
             try:
-                # Detect file type using Magika
-                with open(source_file_path, 'rb') as file:
-                    file_content = file.read()
-                    result = magika.identify_bytes(file_content)
-                    detected_mime_type = result.output.mime_type
-                logging.info(f"Detected MIME type for {file_name}: {detected_mime_type}")
-
-                if detected_mime_type.startswith('application/pdf') and robust_needs_ocr(source_file_path):
-                    logging.info(f"PDF {file_name} requires OCR. Starting advanced OCR process...")
-                    images = convert_pdf_to_images_ocr(source_file_path)
-                    logging.info(f"Converted PDF {file_name} to {len(images)} images for OCR")
-                    with ThreadPoolExecutor() as executor:
-                        extracted_text_list = list(executor.map(ocr_image, images))
-                    content = await process_document_ocr(extracted_text_list)
-                    logging.info(f"Completed advanced OCR processing for {file_name}")
-                elif detected_mime_type.startswith('image/'):
-                    logging.info(f"Performing OCR on image {file_name}")
-                    image = Image.open(source_file_path)
-                    extracted_text = ocr_image(image)
-                    content = await process_document_ocr([extracted_text])
-                else:
-                    logging.info(f"Extracting text from {file_name} using textract")
-                    content = textract.process(source_file_path, encoding='utf-8').decode('utf-8')
-
-                # Post-processing
-                logging.info(f"Applying post-processing to extracted text from {file_name}")
-                content = remove_pagination_breaks(content)
-                sentences = sophisticated_sentence_splitter(content)
-                processed_content = "\n".join(sentences)
-
+                processed_text, mime_type, metadata, used_smart_ocr = await preprocess_document(source_file_path)
+                
+                if not processed_text.strip():
+                    logging.warning(f"No text extracted from {file_name}. Skipping.")
+                    return
+                if used_smart_ocr:
+                    logging.info(f"Smart OCR used for {file_name}. Saving output with markdown file extension.")
+                    converted_file_path = converted_file_path.replace('.txt', '.md')
                 with open(converted_file_path, 'w', encoding='utf-8') as f:
-                    f.write(processed_content)
+                    f.write(processed_text)
                 logging.info(f"Successfully converted {file_name} to plaintext and saved to {converted_file_path}")
 
             except Exception as e:
@@ -1836,6 +1937,24 @@ async def convert_documents_to_plaintext(original_source_dir: str, converted_sou
     await asyncio.gather(*tasks)
     logging.info("Completed conversion of all documents to plaintext")
 
+    # Check for and remove tiny text files
+    removed_files = 0
+    for file_name in os.listdir(converted_source_dir):
+        file_path = os.path.join(converted_source_dir, file_name)
+        if file_name.endswith('.txt') and os.path.getsize(file_path) < 1024:  # Less than 1KB
+            logging.warning(f"Removing tiny converted file: {file_path}")
+            os.remove(file_path)
+            removed_files += 1
+    
+    if removed_files > 0:
+        logging.info(f"Removed {removed_files} tiny converted files (less than 1KB)")
+    else:
+        logging.info("No tiny converted files found")
+
+    logging.info("Document conversion process completed")
+    
+    
+#############################################################################################################################    
     
 # Static configuration
 MAX_SOURCE_DOCUMENTS_TO_CONVERT_TO_PLAINTEXT_AT_ONE_TIME = 5

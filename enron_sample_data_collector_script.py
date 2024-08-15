@@ -113,7 +113,9 @@ async def main():
     
     if len(existing_pdfs) >= expected_number_of_pdfs:
         logging.info(f"Found {len(existing_pdfs)} PDF files of size at least 25KB in {original_source_dir}.")
-        logging.info("Looks like the files have already been downloaded. Exiting.")
+        log_message = "Looks like the Enron exhibit PDF files have already been downloaded, so no need to download them again."
+        logging.info(log_message)
+        print(log_message)
         return
     
     async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=60.0)) as client:
