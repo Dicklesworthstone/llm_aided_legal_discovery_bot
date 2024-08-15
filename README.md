@@ -292,7 +292,7 @@ cd llm_aided_legal_discovery_bot
 pyenv local 3.12
 python -m venv venv
 source venv/bin/activate
-python -m pip install --upgrade pip
+python -m pip install 'pip<24.1' # Pin pip version to avoid issues with textract
 python -m pip install wheel
 python -m pip install --upgrade setuptools wheel
 pip install -r requirements.txt

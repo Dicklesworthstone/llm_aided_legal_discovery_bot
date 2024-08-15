@@ -1,0 +1,17 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: LLM Aided Legal Discovery Automation",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/llm_aided_legal_discovery_bot.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [],
+            "env": {},
+            "cwd": "${workspaceFolder}",
+            "stopOnEntry": false
+        }
+    ]
+}

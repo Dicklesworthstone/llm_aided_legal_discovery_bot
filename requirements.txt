@@ -1,7 +1,9 @@
 aiolimiter
 anthropic
 backoff
+beautifulsoup4
 filelock
+httpx[http2]
 llama-cpp-python
 magika
 numpy
@@ -17,4 +19,5 @@ ruff
 tenacity
 textract 
 tiktoken
+tqdm
 transformers

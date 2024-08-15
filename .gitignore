@@ -165,11 +165,6 @@ cython_debug/
 *.sqlite-shm
 *.sqlite-wal
 *.gguf
-generated_transcript_embeddings_zip_files
-old_logs
-*.csv
-models_url.json
-resource_monitoring_logs.json
-redis_configured.txt
-saved_outputs
-download.lock
+folder_of_source_documents__original_format
+folder_of_source_documents__converted_to_plaintext
+*.zip

@@ -8,6 +8,8 @@ from aiolimiter import AsyncLimiter
 import json
 import re
 from concurrent.futures import ThreadPoolExecutor
+import httpx
+import zipfile
 from pdf2image import convert_from_path
 import pytesseract
 from PIL import Image
@@ -18,8 +20,10 @@ from collections import Counter
 import urllib.request
 import logging
 import warnings
+import email
 from email.parser import BytesParser
 from email.policy import default
+from email.utils import parseaddr, parsedate_to_datetime
 from tenacity import retry, stop_after_attempt, wait_exponential
 from typing import List, Dict, Tuple, Optional, Any
 from llama_cpp import Llama, LlamaGrammar
@@ -33,6 +37,8 @@ import backoff
 from magika import Magika
 import textract
 import PyPDF2
+from tqdm import tqdm
+from enron_sample_data_collector_script import main as enron_collector_main
 
 try:
     import nvgpu
@@ -117,6 +123,86 @@ def parse_email(file_path: str) -> Dict[str, Any]:
         'body': body
     }
     
+def parse_enron_email(file_path: str) -> Dict[str, Any]:
+    with open(file_path, 'r', encoding='utf-8', errors='ignore') as file:
+        content = file.read()
+    
+    # Parse the email content
+    msg = email.message_from_string(content)
+    
+    # Extract basic headers
+    headers = {
+        'From': msg['from'],
+        'To': msg['to'],
+        'Subject': msg['subject'],
+        'Date': msg['date'],
+        'Cc': msg['cc'],
+        'Bcc': msg['bcc'],
+        'X-Folder': msg['X-Folder'],
+        'X-Origin': msg['X-Origin'],
+        'X-FileName': msg['X-FileName'],
+    }
+    
+    # Clean up and normalize headers
+    for key, value in headers.items():
+        if value:
+            headers[key] = ' '.join(value.split())  # Remove extra whitespace
+    
+    # Parse the 'From' field to extract name and email
+    from_name, from_email = parseaddr(headers['From'])
+    headers['From'] = {'name': from_name, 'email': from_email}
+    
+    # Parse the 'To' field to extract multiple recipients
+    if headers['To']:
+        headers['To'] = [{'name': name, 'email': email} for name, email in [parseaddr(addr) for addr in headers['To'].split(',')]]
+    else:
+        headers['To'] = []
+    
+    # Parse the 'Cc' and 'Bcc' fields similarly
+    for field in ['Cc', 'Bcc']:
+        if headers[field]:
+            headers[field] = [{'name': name, 'email': email} for name, email in [parseaddr(addr) for addr in headers[field].split(',')]]
+        else:
+            headers[field] = []
+    
+    # Convert date to a standard format
+    if headers['Date']:
+        try:
+            headers['Date'] = parsedate_to_datetime(headers['Date']).isoformat()
+        except:  # noqa: E722
+            pass  # Keep the original date string if parsing fails
+    
+    # Extract the body
+    body = ""
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_type() == "text/plain":
+                body += part.get_payload(decode=True).decode('utf-8', errors='ignore')
+    else:
+        body = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
+    
+    # Clean up the body
+    body = re.sub(r'\s+', ' ', body).strip()
+    
+    return {
+        'headers': headers,
+        'body': body
+    }
+
+def process_enron_maildir(maildir_path: str) -> List[Dict[str, Any]]:
+    emails = []
+    for root, dirs, files in os.walk(maildir_path):
+        for file in files:
+            if file.endswith('.'):  # Enron maildir files don't have extensions
+                file_path = os.path.join(root, file)
+                try:
+                    email_data = parse_enron_email(file_path)
+                    email_data['file_path'] = file_path
+                    emails.append(email_data)
+                except Exception as e:
+                    print(f"Error processing {file_path}: {str(e)}")
+    return emails
+
 async def parse_document_into_sentences(file_path: str, mime_type: str) -> Tuple[List[str], float, Dict[str, Any]]:
     content = ""
     email_metadata = {}
@@ -154,6 +240,52 @@ async def parse_document_into_sentences(file_path: str, mime_type: str) -> Tuple
     strings = [s.strip() for s in sentences]
     thousands_of_input_words = round(sum(len(s.split()) for s in strings) / 1000, 2)
     return strings, thousands_of_input_words, email_metadata
+
+async def download_and_extract_enron_emails_dataset(url: str, destination_folder: str):
+    zip_file_path = os.path.join(destination_folder, "enron_dataset.zip")
+    
+    # Ensure the destination folder exists
+    os.makedirs(destination_folder, exist_ok=True)
+    
+    # Download the file
+    async with httpx.AsyncClient() as client:
+        async with client.stream("GET", url) as response:
+            total_size = int(response.headers.get("Content-Length", 0))
+            
+            with open(zip_file_path, "wb") as file, tqdm(
+                desc="Downloading Enron dataset",
+                total=total_size,
+                unit="iB",
+                unit_scale=True,
+                unit_divisor=1024,
+            ) as progress_bar:
+                async for chunk in response.aiter_bytes():
+                    size = file.write(chunk)
+                    progress_bar.update(size)
+    
+    # Extract the ZIP file
+    print("Extracting Enron dataset...")
+    with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
+        zip_ref.extractall(destination_folder)
+    
+    # Remove the ZIP file after extraction
+    os.remove(zip_file_path)
+    print(f"Enron dataset extracted to {destination_folder}")
+
+    # Locate the maildir folder
+    maildir_path = None
+    for root, dirs, files in os.walk(destination_folder):
+        if 'maildir' in dirs:
+            maildir_path = os.path.join(root, 'maildir')
+            break
+    
+    if maildir_path:
+        print(f"Maildir found at: {maildir_path}")
+        return maildir_path
+    else:
+        print("Maildir not found in the extracted dataset")
+        return None
+
 
 ##########################################################################
 # OCR Helper Functions
@@ -1401,17 +1533,22 @@ async def process_document_for_discovery(file_path: str, discovery_params: Dict[
     return result
 
 async def generate_discovery_config(user_input: str) -> str:
+    async def call_llm(prompt: str) -> str:
+        return await generate_completion(prompt)
+
     # Step 1: Generate JSON configuration from user input
     json_generation_prompt = f"""
-    Based on the following user input about their discovery goals and case summary, generate a JSON configuration file for legal discovery automation. The JSON should include the following fields:
+    Based on the following user input about their discovery goals and case summary, generate a comprehensive JSON configuration file for legal discovery automation. The JSON should include the following fields:
 
     - case_name: A string representing the name of the case
     - discovery_goals: An array of objects, each containing:
       - description: A string describing the discovery goal
-      - keywords: An array of relevant keywords
-      - importance: A number from 1 to 10 indicating the importance of this goal
+      - keywords: An array of relevant keywords (derived from the user input)
+      - importance: A number from 1 to 10 indicating the importance of this goal (derived from the user input)
     - entities_of_interest: An array of strings representing relevant entities (people, companies, etc.)
     - minimum_importance_score: A number from 0.0 to 100.0 representing the minimum score for a document to be included in the final dossier
+
+    Make sure all the information from the user input is accurately represented, and add any missing details where appropriate.
 
     User input:
     {user_input}
@@ -1419,10 +1556,10 @@ async def generate_discovery_config(user_input: str) -> str:
     Generate the JSON configuration:
     """
 
-    json_config = await generate_completion(json_generation_prompt)
+    json_config = await call_llm(json_generation_prompt)
 
-    # Step 2: Validate and fix the JSON structure
-    validation_prompt = f"""
+    # Step 2: Validate and fix the JSON structure with retry logic
+    validation_prompt_template = """
     The following is a JSON configuration for legal discovery automation. Please verify that it follows the required structure and fix any issues:
 
     {json_config}
@@ -1441,43 +1578,51 @@ async def generate_discovery_config(user_input: str) -> str:
       "minimum_importance_score": number (0.0-100.0)
     }}
 
-    Provide the corrected JSON:
+    Ensure that all discovery goals have corresponding keywords and importance levels, and that the entities of interest are accurately captured.
+
+    Provide the corrected JSON below; IMPORTANT: DO NOT REMOVE OR ABBREVIATE ANY CONTENT FROM THE JSON DATA!!! AND ONLY RESPOND WITH THE CORRECTED JSON, DO NOT ADD ANY EXTRA INFORMATION OR ANY OTHER TEXT, NOT EVEN MARKDOWN CODE BLOCKS:
     """
+    
+    MAX_RETRIES = 5
+    retries = 0
+    while retries < MAX_RETRIES:
+        try:
+            corrected_json = await call_llm(validation_prompt_template.format(json_config=json_config))
+            config_dict = json.loads(corrected_json)
+            validate_config_structure(config_dict)
+            break  # If successful, exit the loop
+        except json.JSONDecodeError:
+            logging.error(f"Attempt {retries + 1}: Failed to parse the JSON. Retrying...")
+            retries += 1
+        except ValueError as e:
+            logging.error(f"Attempt {retries + 1}: Invalid configuration structure: {str(e)}. Retrying...")
+            retries += 1
+        json_config = corrected_json  # Update with the latest version from the LLM
+    else:
+        raise ValueError("Exceeded maximum retries to generate a valid JSON configuration.")
 
-    corrected_json = await generate_completion(validation_prompt)
-
-    # Step 3: Parse and validate the JSON in Python
-    try:
-        config_dict = json.loads(corrected_json)
-        validate_config_structure(config_dict)
-    except json.JSONDecodeError:
-        raise ValueError("Failed to parse the generated JSON.")
-    except ValueError as e:
-        raise ValueError(f"Invalid configuration structure: {str(e)}")
-
-    # Step 4: Generate a descriptive file name
+    # Step 3: Generate a descriptive file name
     file_name_prompt = f"""
     Based on the following case information, generate a short, descriptive file name for the JSON configuration file. Use only lowercase letters and underscores, and end the file name with '.json'.
 
     Case information:
     {json.dumps(config_dict, indent=2)}
 
-    Generate file name:
+    Generate file name (ONLY RESPOND WITH THE CORRECTED FILE NAME, DO NOT ADD ANY EXTRA INFORMATION OR ANY OTHER TEXT, NOT EVEN MARKDOWN CODE BLOCKS):
     """
 
-    file_name = await generate_completion(file_name_prompt)
+    file_name = await call_llm(file_name_prompt)
     file_name = re.sub(r'[^a-z_.]', '', file_name.strip().lower())
     if not file_name.endswith('.json'):
         file_name += '.json'
-
-    # Step 5: Save the JSON file
+        
+    # Step 4: Save the JSON file
     config_folder = 'discovery_configuration_json_files'
     os.makedirs(config_folder, exist_ok=True)
     file_path = os.path.join(config_folder, file_name)
-
     with open(file_path, 'w') as f:
         json.dump(config_dict, f, indent=2)
-
+    logging.info(f"Configuration saved successfully to {file_path}")
     return file_path
 
 def validate_config_structure(config: Dict[str, Any]):
@@ -1595,6 +1740,87 @@ The key people we're interested in are John Smith (TechCorp's CTO) and Sarah Joh
 We want to focus on documents from the last 5 years, and only include highly relevant documents in our final report.
 """
 
+use_enron_example = 1
+
+if use_enron_example:
+    use_more_basic_freeform_text_goal_input = 0
+    
+    logging.info("Using Enron example, so replacing free-form text goal input with Enron-specific input.")
+    
+    if use_more_basic_freeform_text_goal_input:
+        USER_FREEFORM_TEXT_GOAL_INPUT = """
+        We're representing shareholders in a lawsuit against Enron Corporation and its key executives. Our clients suspect fraudulent accounting practices and misrepresentation of the company's financial health. We need to conduct a thorough investigation of Enron's internal communications and financial documents from the past 5 years.
+
+        Key discovery goals:
+        1. Uncover evidence of deliberate financial misreporting or fraudulent accounting practices.
+        2. Identify communications discussing the creation or use of off-book entities to hide debt or inflate profits.
+        3. Find instances where executives acknowledged financial problems while publicly claiming the company was healthy.
+        4. Discover any discussions about manipulating energy markets or prices.
+        5. Locate evidence of insider trading by executives or their associates.
+        6. Identify any attempts to pressure or influence auditors (Arthur Andersen) to approve questionable financial statements.
+        7. Find communications discussing the risks or potential consequences of their accounting practices.
+        8. Uncover any evidence of document shredding or attempts to hide information.
+
+        We're particularly interested in communications involving key executives such as Kenneth Lay (CEO), Jeffrey Skilling (COO/CEO), Andrew Fastow (CFO), and Richard Causey (Chief Accounting Officer). Other persons of interest include executives at Arthur Andersen and any mention of financial analysts who were skeptical of Enron's reported profits.
+
+        Focus on documents that discuss Special Purpose Entities (SPEs), mark-to-market accounting, the Raptors, LJM partnerships, and any mentions of "aggressive" accounting practices. We're also interested in any discussions about the company's stock price, especially in relation to executive compensation or stock options.
+
+        Prioritize highly relevant documents that clearly demonstrate knowledge of wrongdoing or attempts to deceive shareholders, auditors, or regulators. We're looking for smoking guns - clear admissions of guilt, discussions of illegal activities, or explicit concerns about the legality or ethics of their practices.
+
+        The final report should provide a clear narrative of how Enron's executives deliberately misled shareholders and manipulated financial statements, supported by the most damning evidence found in the documents.
+        """
+    else:
+        USER_FREEFORM_TEXT_GOAL_INPUT = """
+        Case Name: Shareholders vs. Enron Corporation
+
+        Summary:
+        We are representing shareholders in a lawsuit against Enron Corporation and its key executives. Our clients suspect fraudulent accounting practices and misrepresentation of the company's financial health. The investigation will focus on Enron's internal communications and financial documents from the past 5 years.
+
+        Discovery Goals:
+        1. Uncover evidence of deliberate financial misreporting or fraudulent accounting practices.
+        - Keywords: financial misreporting, fraud, accounting practices
+        - Importance: 10
+
+        2. Identify communications discussing the creation or use of off-book entities to hide debt or inflate profits.
+        - Keywords: off-book entities, hide debt, inflate profits
+        - Importance: 9
+
+        3. Find instances where executives acknowledged financial problems while publicly claiming the company was healthy.
+        - Keywords: executives acknowledgment, financial problems, public claims
+        - Importance: 8
+
+        4. Discover any discussions about manipulating energy markets or prices.
+        - Keywords: manipulating markets, energy prices, market manipulation
+        - Importance: 7
+
+        5. Locate evidence of insider trading by executives or their associates.
+        - Keywords: insider trading, executives, associates
+        - Importance: 8
+
+        6. Identify any attempts to pressure or influence auditors (Arthur Andersen) to approve questionable financial statements.
+        - Keywords: pressure auditors, Arthur Andersen, questionable statements
+        - Importance: 9
+
+        7. Find communications discussing the risks or potential consequences of their accounting practices.
+        - Keywords: risks, accounting practices, consequences
+        - Importance: 6
+
+        8. Uncover any evidence of document shredding or attempts to hide information.
+        - Keywords: document shredding, hide information, destruction of evidence
+        - Importance: 8
+
+        Entities of Interest:
+        - Kenneth Lay (CEO)
+        - Jeffrey Skilling (COO/CEO)
+        - Andrew Fastow (CFO)
+        - Richard Causey (Chief Accounting Officer)
+        - Arthur Andersen (auditors)
+        - Financial analysts skeptical of Enron’s profits
+
+        Minimum Importance Score:
+        - 70.0
+        """
+
 async def main():
     # Set up logging
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -1629,7 +1855,7 @@ async def main():
     file_handler.setLevel(logging.INFO)
     logging.getLogger().addHandler(file_handler)
 
-    # Step 2: Convert source documents to plaintext
+    # Step 2a: Convert source documents to plaintext
     logging.info("Converting source documents to plaintext")
     for file_name in os.listdir(original_source_dir):
         source_file_path = os.path.join(original_source_dir, file_name)
@@ -1643,6 +1869,48 @@ async def main():
                 logging.info(f"Converted {file_name} to plaintext")
             except Exception as e:
                 logging.error(f"Error converting {file_name}: {str(e)}")
+                
+    # Step 2b: Process Enron email corpus
+    if use_enron_example:
+        logging.info("Processing Enron email corpus")
+        enron_dataset_url = "https://tile.loc.gov/storage-services/master/gdc/gdcdatasets/2018487913/2018487913.zip"
+        logging.info(f"Checking if Enron dataset is already downloaded at {original_source_dir}")
+        if os.path.exists(os.path.join(original_source_dir, "maildir")):
+            logging.info("Enron dataset already downloaded")
+            maildir_path = os.path.join(original_source_dir, "maildir")
+        else:
+            logging.info("Enron dataset not found, downloading...")
+            maildir_path = await download_and_extract_enron_emails_dataset(enron_dataset_url, original_source_dir)
+        if maildir_path:
+            # Process Enron email corpus
+            logging.info("Now processing downloaded Enron email corpus")
+            enron_emails = process_enron_maildir(maildir_path)
+            for email_data in enron_emails:
+                logging.info("Processing Enron email corpus")
+                enron_maildir_path = os.path.join(original_source_dir, 'maildir')
+                if os.path.exists(enron_maildir_path):
+                    enron_emails = process_enron_maildir(enron_maildir_path)
+                    for email_data in enron_emails:
+                        file_path = email_data['file_path']
+                        content = f"From: {email_data['headers']['From']['name']} <{email_data['headers']['From']['email']}>\n"
+                        content += f"To: {', '.join([f'{r['name']} <{r['email']}>' for r in email_data['headers']['To']])}\n"
+                        content += f"Subject: {email_data['headers']['Subject']}\n"
+                        content += f"Date: {email_data['headers']['Date']}\n\n"
+                        content += email_data['body']
+                        base_name = os.path.relpath(file_path, enron_maildir_path).replace('/', '_')
+                        converted_file_path = os.path.join(converted_source_dir, f"{base_name}.txt")
+                        os.makedirs(os.path.dirname(converted_file_path), exist_ok=True)
+                        with open(converted_file_path, 'w', encoding='utf-8') as f:
+                            f.write(content)
+                        logging.info(f"Converted Enron email: {file_path}")
+                else:
+                    logging.warning(f"Enron maildir not found at {enron_maildir_path}")            
+        else:
+            logging.error("Failed to locate Enron maildir. Skipping Enron email processing.")                
+        
+        logging.info("Now downloading miscellaneous Enron related exhibits as PDFs...")
+        await enron_collector_main()
+        logging.info("Enron sample data collection completed.")
 
     # Load the list of previously processed files
     processed_files_path = os.path.join(project_root, 'processed_files.json')
