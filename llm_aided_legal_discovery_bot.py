@@ -7,37 +7,41 @@ from functools import partial
 from aiolimiter import AsyncLimiter
 import json
 import re
-from concurrent.futures import ThreadPoolExecutor
-import httpx
+import io
+import base64
+import sqlite3
 import zipfile
-from pdf2image import convert_from_path
-import pytesseract
-from PIL import Image
-import cv2
-import numpy as np
 import hashlib
-from collections import Counter
-import urllib.request
-import picologging as logging
 import warnings
 import email
 from email.parser import BytesParser
 from email.policy import default
 from email.utils import parseaddr, parsedate_to_datetime
-from tenacity import retry, stop_after_attempt, wait_exponential
+from collections import Counter
+import urllib.request
 from typing import List, Dict, Tuple, Optional, Any
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+import numpy as np
+import picologging as logging
+from decouple import Config as DecoupleConfig, RepositoryEnv
+from magika import Magika
+from tqdm import tqdm
+import httpx
+import backoff
+from tenacity import retry, stop_after_attempt, wait_exponential
+import textract
+import PyPDF2
+from pdf2image import convert_from_path
+import pytesseract
+from PIL import Image
+import cv2
 from llama_cpp import Llama, LlamaGrammar
 import tiktoken
-from decouple import Config as DecoupleConfig, RepositoryEnv
 from filelock import FileLock, Timeout
 from transformers import AutoTokenizer
 from openai import AsyncOpenAI, APIError, RateLimitError
 from anthropic import AsyncAnthropic
-import backoff
-from magika import Magika
-import textract
-import PyPDF2
-from tqdm import tqdm
 from enron_sample_data_collector_script import main as enron_collector_main
 
 try:
@@ -1987,13 +1991,336 @@ async def convert_documents_to_plaintext(original_source_dir: str, converted_sou
 
     logging.info("Document conversion process completed")
     
+async def check_corrupted_output_file(file_path: str, original_file_path: str) -> dict:
+    """
+    Check if the output file is likely corrupted or unusable due to failed OCR.
     
+    :param file_path: Path to the processed output file
+    :param original_file_path: Path to the original input file
+    :return: Dictionary with corruption status and explanation
+    """
+    with open(file_path, 'r', encoding='utf-8') as file:
+        content = file.read()
+    
+    # Prepare the prompt for the LLM
+    prompt = f"""Analyze the following text content from a processed document and determine if it's likely corrupted or unusable due to failed OCR. Consider these factors:
+
+1. Presence of random characters or non-readable text
+2. Lack of coherent sentences or paragraphs
+3. Excessive repetition of patterns or characters
+4. Presence of OCR artifacts like misinterpreted characters
+
+Text content:
+{content[:1000]}  # Limiting to first 1000 characters for brevity
+
+Provide your analysis in the following format:
+CORRUPTED: [Yes/No]
+EXPLANATION: [Brief explanation of why the content is considered corrupted or not]
+USABILITY_SCORE: [0-100, where 0 is completely unusable and 100 is perfect]
+"""
+
+    # Call the LLM for analysis
+    response = await generate_completion(prompt)
+    
+    # Parse the response
+    analysis = {}
+    for line in response.split('\n'):
+        if ':' in line:
+            key, value = line.split(':', 1)
+            analysis[key.strip()] = value.strip()
+    
+    is_corrupted = analysis.get('CORRUPTED', '').lower() == 'yes'
+    usability_score = int(analysis.get('USABILITY_SCORE', '0'))
+    
+    return {
+        'input_file': original_file_path,
+        'output_file': file_path,
+        'is_corrupted': is_corrupted,
+        'explanation': analysis.get('EXPLANATION', ''),
+        'usability_score': usability_score
+    }
+
+async def process_output_directory_to_check_for_corrupted_or_failed_files(output_dir: str, original_dir: str):
+    """
+    Process all files in the output directory and identify corrupted files.
+    
+    :param output_dir: Directory containing processed output files
+    :param original_dir: Directory containing original input files
+    """
+    corrupted_files = []
+    
+    for filename in os.listdir(output_dir):
+        if filename.endswith('.txt') or filename.endswith('.md'):
+            output_file_path = os.path.join(output_dir, filename)
+            original_file_path = os.path.join(original_dir, os.path.splitext(filename)[0] + '.pdf')
+            
+            result = await check_corrupted_output_file(output_file_path, original_file_path)
+            if result['is_corrupted'] or result['usability_score'] < 50:
+                corrupted_files.append(result)
+    
+    # Save the list of corrupted files
+    with open(LIKELY_CORRUPTED_OUTPUT_FILES_JSON_PATH, 'w') as f:
+        json.dump(corrupted_files, f, indent=2)
+    
+    logging.info(f"Identified {len(corrupted_files)} potentially corrupted or unusable files. Results saved to likely_corrupted_output_files.json")
+
+async def process_with_gpt4_vision(file_path: str) -> str:
+    """
+    Process a PDF file using the GPT-4 Vision API.
+    
+    :param file_path: Path to the PDF file
+    :return: Extracted text content
+    """
+    images = convert_pdf_to_images_ocr(file_path)
+    all_text = []
+
+    for i, img in enumerate(images):
+        logging.info(f"Processing page {i+1} of {len(images)}")
+        
+        # Preprocess the image
+        preprocessed_img = preprocess_image_ocr(img)
+        
+        # Convert image to base64
+        buffered = io.BytesIO()
+        preprocessed_img.save(buffered, format="PNG")
+        img_str = base64.b64encode(buffered.getvalue()).decode()
+
+        # Prepare the prompt
+        prompt = f"""Please transcribe the text content from this image. This is page {i+1} of {len(images)} from a document.
+        Maintain the original formatting as much as possible, including paragraphs, lists, and tables.
+        Ignore any images or diagrams, focusing solely on the text content."""
+
+        messages = [
+            {"role": "system", "content": "You are a highly accurate OCR system."},
+            {"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_str}"}}
+            ]}
+        ]
+
+        try:
+            response = await api_request_with_retry(
+                openai_client.chat.completions.create,
+                model="gpt-4-vision-preview",
+                messages=messages,
+                max_tokens=calculate_safe_max_tokens(1000, OPENAI_MAX_TOKENS),  # Adjust as needed
+                temperature=0.7,
+            )
+            page_text = response.choices[0].message.content
+            all_text.append(page_text)
+            logging.info(f"Successfully processed page {i+1}")
+        except (RateLimitError, APIError) as e:
+            logging.error(f"OpenAI API error on page {i+1}: {str(e)}")
+        except Exception as e:
+            logging.error(f"An unexpected error occurred while processing page {i+1}: {str(e)}")
+
+    return "\n\n--- New Page ---\n\n".join(all_text)
+
+async def process_corrupted_files_with_gpt4_vision(corrupted_files_path: str):
+    """
+    Process corrupted files using GPT-4 Vision API.
+    
+    :param corrupted_files_path: Path to the JSON file containing corrupted file information
+    """
+    with open(corrupted_files_path, 'r') as f:
+        corrupted_files = json.load(f)
+    
+    for file_info in corrupted_files:
+        input_file = file_info['input_file']
+        output_file = file_info['output_file']
+        
+        logging.info(f"Processing {input_file} with GPT-4 Vision API")
+        
+        try:
+            extracted_text = await process_with_gpt4_vision(input_file)
+            
+            # Save the extracted text to a new file
+            new_output_file = output_file.replace('.txt', '_gpt4vision.txt').replace('.md', '_gpt4vision.md')
+            with open(new_output_file, 'w', encoding='utf-8') as f:
+                f.write(extracted_text)
+            
+            logging.info(f"Successfully processed {input_file}. Result saved to {new_output_file}")
+        except Exception as e:
+            logging.error(f"Error processing {input_file} with GPT-4 Vision API: {str(e)}")
+            
+def create_and_populate_case_sqlite_database(config_file_path, converted_source_dir, original_source_dir):
+    db_dir = 'sqlite_database_files_of_converted_documents'
+    os.makedirs(db_dir, exist_ok=True)
+
+    config_base_name = os.path.splitext(os.path.basename(config_file_path))[0]
+    db_file_path = os.path.join(db_dir, f"{config_base_name}.sqlite")
+
+    conn = sqlite3.connect(db_file_path)
+    cursor = conn.cursor()
+
+    # Create enhanced case_metadata table
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS case_metadata (
+        id INTEGER PRIMARY KEY,
+        config_file_path TEXT,
+        freeform_input_text TEXT,
+        json_config TEXT,
+        case_name TEXT,
+        creation_date TEXT
+    )
+    ''')
+
+    # Create enhanced documents table
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS documents (
+        id INTEGER PRIMARY KEY,
+        original_filename TEXT,
+        converted_filename TEXT,
+        file_hash TEXT UNIQUE,
+        document_text TEXT,
+        mime_type TEXT,
+        file_size_bytes INTEGER,
+        creation_date TEXT,
+        last_modified_date TEXT,
+        is_email BOOLEAN,
+        email_from TEXT,
+        email_to TEXT,
+        email_subject TEXT,
+        email_date TEXT,
+        ocr_applied BOOLEAN,
+        importance_score REAL,
+        relevance_score REAL
+    )
+    ''')
+
+    # Create discovery_goals table
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS discovery_goals (
+        id INTEGER PRIMARY KEY,
+        description TEXT,
+        importance INTEGER
+    )
+    ''')
+
+    # Create keywords table
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS keywords (
+        id INTEGER PRIMARY KEY,
+        keyword TEXT UNIQUE,
+        goal_id INTEGER,
+        FOREIGN KEY (goal_id) REFERENCES discovery_goals (id)
+    )
+    ''')
+
+    # Create entities_of_interest table
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS entities_of_interest (
+        id INTEGER PRIMARY KEY,
+        entity_name TEXT UNIQUE
+    )
+    ''')
+
+    # Create document_entities table (for many-to-many relationship)
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS document_entities (
+        document_id INTEGER,
+        entity_id INTEGER,
+        FOREIGN KEY (document_id) REFERENCES documents (id),
+        FOREIGN KEY (entity_id) REFERENCES entities_of_interest (id),
+        PRIMARY KEY (document_id, entity_id)
+    )
+    ''')
+
+    # Insert case metadata
+    with open(config_file_path, 'r') as config_file:
+        config_data = json.load(config_file)
+    
+    cursor.execute('''
+    INSERT INTO case_metadata (config_file_path, freeform_input_text, json_config, case_name, creation_date)
+    VALUES (?, ?, ?, ?, ?)
+    ''', (config_file_path, USER_FREEFORM_TEXT_GOAL_INPUT, json.dumps(config_data), config_data['case_name'], datetime.now().isoformat()))
+
+    # Insert discovery goals and keywords
+    for goal in config_data['discovery_goals']:
+        cursor.execute('INSERT INTO discovery_goals (description, importance) VALUES (?, ?)',
+                       (goal['description'], goal['importance']))
+        goal_id = cursor.lastrowid
+        for keyword in goal['keywords']:
+            cursor.execute('INSERT OR IGNORE INTO keywords (keyword, goal_id) VALUES (?, ?)',
+                           (keyword, goal_id))
+
+    # Insert entities of interest
+    for entity in config_data['entities_of_interest']:
+        cursor.execute('INSERT OR IGNORE INTO entities_of_interest (entity_name) VALUES (?)',
+                       (entity,))
+
+    # Insert documents
+    for filename in os.listdir(converted_source_dir):
+        file_path = os.path.join(converted_source_dir, filename)
+        original_file_path = os.path.join(original_source_dir, os.path.splitext(filename)[0] + '.pdf')
+        
+        if os.path.isfile(file_path):
+            with open(file_path, 'r', encoding='utf-8') as file:
+                document_text = file.read()
+            
+            file_hash = hashlib.sha256(document_text.encode()).hexdigest()
+            
+            # Get file metadata
+            file_stats = os.stat(file_path)
+            creation_date = datetime.fromtimestamp(file_stats.st_ctime).isoformat()
+            last_modified_date = datetime.fromtimestamp(file_stats.st_mtime).isoformat()
+            
+            # Determine if OCR was applied (assuming files processed with OCR end with .md)
+            ocr_applied = filename.endswith('.md')
+            
+            # Check if it's an email (simplified check, can be improved)
+            is_email = 'From:' in document_text[:100] and 'To:' in document_text[:200]
+            
+            if is_email:
+                # Extract email metadata (simplified, can be improved)
+                email_from = document_text.split('From:', 1)[1].split('\n', 1)[0].strip()
+                email_to = document_text.split('To:', 1)[1].split('\n', 1)[0].strip()
+                email_subject = document_text.split('Subject:', 1)[1].split('\n', 1)[0].strip()
+                email_date = document_text.split('Date:', 1)[1].split('\n', 1)[0].strip()
+            else:
+                email_from = email_to = email_subject = email_date = None
+
+            # Insert document into the database
+            cursor.execute('''
+            INSERT OR REPLACE INTO documents (
+                original_filename, converted_filename, file_hash, document_text,
+                mime_type, file_size_bytes, creation_date, last_modified_date,
+                is_email, email_from, email_to, email_subject, email_date,
+                ocr_applied, importance_score, relevance_score
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                os.path.basename(original_file_path), filename, file_hash, document_text,
+                'text/plain', file_stats.st_size, creation_date, last_modified_date,
+                is_email, email_from, email_to, email_subject, email_date,
+                ocr_applied, 0, 0  # Placeholder scores, to be updated later
+            ))
+            
+            # Insert document-entity relationships
+            document_id = cursor.lastrowid
+            for entity in config_data['entities_of_interest']:
+                if entity.lower() in document_text.lower():
+                    cursor.execute('''
+                    INSERT OR IGNORE INTO document_entities (document_id, entity_id)
+                    SELECT ?, id FROM entities_of_interest WHERE entity_name = ?
+                    ''', (document_id, entity))
+
+    # Create full-text search index
+    cursor.execute('CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(document_text, content=documents, content_rowid=id)')
+    cursor.execute('INSERT INTO documents_fts(documents_fts) VALUES ("rebuild")')
+
+    conn.commit()
+    conn.close()
+
+    print(f"Enhanced SQLite database created and populated at: {db_file_path}")
+                
 #############################################################################################################################    
     
 # Static configuration
 MAX_SOURCE_DOCUMENTS_TO_CONVERT_TO_PLAINTEXT_AT_ONE_TIME = 5
+USE_GPT4_VISION_MODEL_FOR_FAILED_OR_CORRUPTED_FILES = 0
 USE_OVERRIDE_DISCOVERY_CONFIG_JSON_FILE = 1  # Set to 1 to use override file
 OVERRIDE_CONFIG_FILE_PATH = "discovery_configuration_json_files/shareholders_vs_enron_corporation.json"
+LIKELY_CORRUPTED_OUTPUT_FILES_JSON_PATH = 'likely_corrupted_output_files.json'
 USER_FREEFORM_TEXT_GOAL_INPUT = """
 We're working on a case involving patent infringement by TechCorp against our client, InnovativeTech. 
 We need to find any communications or documents that discuss TechCorp's knowledge of our client's patent 
@@ -2127,8 +2454,19 @@ async def main():
     # Step 2a: Convert source documents to plaintext
     logging.info("Now converting source documents to plaintext (and performing OCR if needed)...")
     await convert_documents_to_plaintext(original_source_dir, converted_source_dir)
-                
-    # Step 2b: Process Enron email corpus
+    
+    # Step 2b: Check for corrupted/failed output files
+    logging.info("Now checking for corrupted or failed output files...")
+    
+    await process_output_directory_to_check_for_corrupted_or_failed_files(converted_source_dir, original_source_dir)
+    if USE_GPT4_VISION_MODEL_FOR_FAILED_OR_CORRUPTED_FILES:
+        await process_corrupted_files_with_gpt4_vision(LIKELY_CORRUPTED_OUTPUT_FILES_JSON_PATH)
+                    
+    # New step: Create and populate a SQLite database for the discovery case containing converted documents and their metadata and other relevant information
+    logging.info("Creating and populating SQLite database...")
+    create_and_populate_case_sqlite_database(config_file_path, converted_source_dir)
+                        
+    # Step 2c: Process Enron email corpus
     if use_enron_example:
         logging.info("Processing Enron email corpus")
         enron_dataset_url = "https://tile.loc.gov/storage-services/master/gdc/gdcdatasets/2018487913/2018487913.zip"                
