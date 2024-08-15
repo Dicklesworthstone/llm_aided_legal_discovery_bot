@@ -1,16 +1,16 @@
-# Legal Discovery Automation
+# LLM-Aided Legal Discovery Automation
 
 ## Table of Contents
 
 ## Introduction
 
-Legal Discovery Automation is a sophisticated tool designed to revolutionize the process of legal discovery by leveraging advanced natural language processing and machine learning techniques. This project addresses the common challenges faced by legal professionals when dealing with large volumes of documents in cases such as corporate litigation, intellectual property disputes, or regulatory investigations.
+ LLM-Aided Legal Discovery Automation is a sophisticated tool designed to automate much of the process of legal discovery by leveraging advanced AI models. This project addresses the common challenges faced by legal professionals when dealing with large volumes of documents in cases such as corporate litigation, intellectual property disputes, or regulatory investigations.
 
 Traditional legal discovery processes are often overwhelming, requiring legal teams to manually sift through thousands or even millions of documents to find relevant information. This manual approach is not only time-consuming and labor-intensive but also prone to human error, potentially missing crucial evidence or insights.
 
 Our Legal Discovery Automation tool transforms this process by:
 
-1. **Simplifying User Input**: Users can easily specify their discovery goals through a structured template or by answering a few key questions about their case.
+1. **Simplifying User Input**: Users can easily specify their discovery goals through a structured template or by explaining the key issues and what they are trying to establish or argue in their case (in which case the tool will generate a structured JSON configuration file for you automatically).
 
 2. **Handling Diverse Document Types**: The system processes a wide range of document formats, including scanned PDFs, native digital PDFs, .doc, .docx, .txt, .html files, and even Outlook email archives.
 
@@ -122,7 +122,7 @@ The Legal Discovery Automation tool is designed with flexibility and scalability
 - Uses asyncio for efficient I/O operations
 - Implements rate limiting for API calls to prevent overload
 
-## Detailed Functionality
+## More Implementation Details and Rationale
 
 ### 1. Configuration Generation
 
@@ -288,7 +288,7 @@ pyenv install 3.12
 
 ```bash
 git clone https://github.com/Dicklesworthstone/llm_aided_legal_discovery_bot.git
-cd legal-discovery-automation
+cd llm_aided_legal_discovery_bot
 pyenv local 3.12
 python -m venv venv
 source venv/bin/activate
@@ -345,16 +345,13 @@ Additionally, a log file `[case_name].log` is generated with detailed processing
 ## Performance Considerations
 
 - Processing time scales with the number and size of input documents.
-- Parallel processing improves performance but may increase memory usage.
 - API rate limits may affect processing speed when using cloud-based LLMs.
-- Consider using a local LLM for faster processing and to avoid API costs for large document sets.
 
 ## Limitations and Future Improvements
 
 - Currently limited to text-based analysis; future versions could incorporate image and audio analysis.
 - Accuracy depends on the quality of the AI models used; regular updates to models can improve performance.
 - Could benefit from a user interface for easier configuration and result visualization.
-- Integration with legal case management software could enhance workflow efficiency.
 
 ## Contributing
 
