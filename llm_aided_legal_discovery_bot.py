@@ -237,22 +237,27 @@ async def download_and_extract_enron_emails_dataset(url: str, destination_folder
     zip_file_path = os.path.join(destination_folder, "enron_dataset.zip")
     # Ensure the destination folder exists
     os.makedirs(destination_folder, exist_ok=True)
-    # Download the file
-    async with httpx.AsyncClient() as client:
-        async with client.stream("GET", url) as response:
-            total_size = int(response.headers.get("Content-Length", 0))
-            with open(zip_file_path, "wb") as file, tqdm(
-                desc="Downloading Enron dataset",
-                total=total_size,
-                unit="iB",
-                unit_scale=True,
-                unit_divisor=1024,
-            ) as progress_bar:
-                async for chunk in response.aiter_bytes():
-                    size = file.write(chunk)
-                    progress_bar.update(size)
+    # Download the file if it doesn't exist
+    if not os.path.exists(zip_file_path):
+        logging.info(f"Downloading Enron dataset from {url}")
+        async with httpx.AsyncClient() as client:
+            async with client.stream("GET", url) as response:
+                total_size = int(response.headers.get("Content-Length", 0))
+                
+                with open(zip_file_path, "wb") as file, tqdm(
+                    desc="Downloading Enron dataset",
+                    total=total_size,
+                    unit="iB",
+                    unit_scale=True,
+                    unit_divisor=1024,
+                ) as progress_bar:
+                    async for chunk in response.aiter_bytes():
+                        size = file.write(chunk)
+                        progress_bar.update(size)
+    else:
+        logging.info(f"Enron dataset zip file already exists at {zip_file_path}")
     # Extract the ZIP file
-    print("Extracting Enron dataset...")
+    logging.info("Extracting Enron dataset...")
     temp_extract_folder = os.path.join(destination_folder, "temp_extract")
     os.makedirs(temp_extract_folder, exist_ok=True)
     with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
@@ -264,17 +269,17 @@ async def download_and_extract_enron_emails_dataset(url: str, destination_folder
         if os.path.exists(final_maildir):
             shutil.rmtree(final_maildir)
         shutil.move(extracted_maildir, final_maildir)
-        print(f"Maildir moved to: {final_maildir}")
+        logging.info(f"Maildir moved to: {final_maildir}")
     else:
-        print("Maildir not found in the extracted dataset")
+        logging.error(f"Maildir not found in the extracted dataset at {extracted_maildir}")
     # Clean up
     shutil.rmtree(temp_extract_folder)
     os.remove(zip_file_path)
-    print("Enron dataset extracted and cleaned up")
+    logging.info("Enron dataset extracted and cleaned up")
     if os.path.exists(final_maildir):
         return final_maildir
     else:
-        print("Failed to locate the final Maildir")
+        logging.error("Failed to locate the final Maildir")
         return None
 
 async def process_enron_email_corpus(
@@ -287,7 +292,6 @@ async def process_enron_email_corpus(
     enron_dataset_url = "https://tile.loc.gov/storage-services/master/gdc/gdcdatasets/2018487913/2018487913.zip"                
     enron_dataset_dir = os.path.join(project_root, 'enron_email_data')
     os.makedirs(enron_dataset_dir, exist_ok=True)
-    zip_file_path = os.path.join(enron_dataset_dir, "enron_dataset.zip")
     maildir_path = os.path.join(enron_dataset_dir, 'maildir')
     # Check if the maildir already contains the expected number of subdirectories
     if os.path.exists(maildir_path):
@@ -296,35 +300,15 @@ async def process_enron_email_corpus(
             logging.info("Enron email corpus already extracted and present. Skipping download and extraction.")
             return process_extracted_emails(maildir_path, converted_source_dir, turn_enron_email_archive_into_individual_converted_markdown_files_per_sender)
     # If we don't have the complete extracted data, proceed with download and extraction
-    if not os.path.exists(zip_file_path):
-        logging.info("Downloading Enron dataset...")
-        await download_and_extract_enron_emails_dataset(enron_dataset_url, enron_dataset_dir)
-    else:
-        logging.info("Enron dataset zip file already downloaded. Proceeding to extraction.")
-    logging.info("Extracting Enron dataset...")
-    with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
-        for member in zip_ref.namelist():
-            filename = os.path.basename(member)
-            if not filename:
-                continue
-            source = zip_ref.open(member)
-            target = open(os.path.join(enron_dataset_dir, filename), "wb")
-            with source, target:
-                shutil.copyfileobj(source, target)
-    # Move maildir to correct location (removing the '2018487913' part)
-    temp_maildir = os.path.join(enron_dataset_dir, '2018487913', 'maildir')
-    if os.path.exists(temp_maildir):
-        if os.path.exists(maildir_path):
-            shutil.rmtree(maildir_path)
-        shutil.move(temp_maildir, maildir_path)
-        shutil.rmtree(os.path.join(enron_dataset_dir, '2018487913'))
-    if not os.path.exists(maildir_path):
-        logging.error("Failed to locate Enron maildir after extraction. Skipping Enron email processing.")
+    logging.info("Downloading and extracting Enron dataset...")
+    maildir_path = await download_and_extract_enron_emails_dataset(enron_dataset_url, enron_dataset_dir)
+    if not maildir_path or not os.path.exists(maildir_path):
+        logging.error("Failed to download or extract Enron dataset. Skipping Enron email processing.")
         return
     return process_extracted_emails(maildir_path, converted_source_dir, turn_enron_email_archive_into_individual_converted_markdown_files_per_sender)
 
 def process_extracted_emails(maildir_path, converted_source_dir, turn_enron_email_archive_into_individual_converted_markdown_files_per_sender):
-    logging.info("Now processing extracted Enron email corpus")
+    logging.info(f"Now processing extracted Enron email corpus from {maildir_path}")
     enron_emails = process_enron_maildir(maildir_path)
     if turn_enron_email_archive_into_individual_converted_markdown_files_per_sender:
         sender_emails = {}
