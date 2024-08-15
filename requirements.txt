@@ -5,6 +5,7 @@ beautifulsoup4
 filelock
 httpx[http2]
 llama-cpp-python
+lxml
 magika
 numpy
 nvgpu

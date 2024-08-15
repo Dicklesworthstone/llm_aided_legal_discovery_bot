@@ -291,22 +291,69 @@ async def download_and_extract_enron_emails_dataset(url: str, destination_folder
 # OCR Helper Functions
 ##########################################################################
 
-def needs_ocr(pdf_path: str) -> bool:
+def robust_needs_ocr(file_path: str) -> bool:
     """
-    Check if a PDF file needs OCR by attempting to extract text directly.
-    If no text is found, it likely needs OCR.
+    Determine if a file needs OCR using multiple methods.
     """
+    logging.info(f"Checking if {file_path} needs OCR")
+    
+    # For PDFs
+    if file_path.lower().endswith('.pdf'):
+        return needs_ocr_pdf(file_path)
+    
+    # For images
+    if file_path.lower().endswith(('.png', '.jpg', '.jpeg', '.tiff', '.bmp', '.gif')):
+        return True
+    
+    # For other file types, assume no OCR needed
+    return False
 
-    with open(pdf_path, 'rb') as file:
-        reader = PyPDF2.PdfReader(file)
-        text = ""
-        for page in reader.pages:
-            text += page.extract_text() or ""
-
-    # Remove whitespace and check if there's any text content
-    if re.sub(r'\s', '', text):
-        return False
+def needs_ocr_pdf(pdf_path: str) -> bool:
+    """
+    Check if a PDF needs OCR by attempting multiple methods of text extraction.
+    """
+    logging.info(f"Checking if PDF {pdf_path} needs OCR")
+    
+    try:
+        with open(pdf_path, 'rb') as file:
+            reader = PyPDF2.PdfReader(file)
+            
+            # Check a sample of pages (e.g., first, middle, and last if available)
+            pages_to_check = [0, len(reader.pages) // 2, -1]
+            for page_num in pages_to_check:
+                if page_num < len(reader.pages):
+                    page = reader.pages[page_num]
+                    text = page.extract_text()
+                    
+                    # If we find meaningful text, no OCR needed
+                    if len(text.strip()) > 50:  # Adjust threshold as needed
+                        logging.info(f"Found sufficient text in PDF {pdf_path} on page {page_num+1}. OCR not needed.")
+                        return False
+    
+    except Exception as e:
+        logging.error(f"Error checking PDF {pdf_path}: {str(e)}")
+    
+    logging.info(f"PDF {pdf_path} likely needs OCR.")
     return True
+
+def perform_simple_ocr_on_image(image_path: str) -> str:
+    """
+    Perform OCR on a single image.
+    """
+    logging.info(f"Performing OCR on image: {image_path}")
+    image = cv2.imread(image_path)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    
+    # Apply thresholding to preprocess the image
+    gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
+    
+    # Apply dilation to connect text components
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
+    gray = cv2.dilate(gray, kernel, iterations=1)
+    
+    # Perform text extraction
+    text = pytesseract.image_to_string(gray)
+    return text
 
 def preprocess_image_ocr(image):
     gray = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2GRAY)
@@ -1727,10 +1774,73 @@ def load_processed_files(save_path: str) -> Dict[str, str]:
             return json.load(f)
     return {}
 
+async def convert_documents_to_plaintext(original_source_dir: str, converted_source_dir: str):
+    logging.info("Starting conversion of source documents to plaintext")
+    os.makedirs(converted_source_dir, exist_ok=True)
+    semaphore = asyncio.Semaphore(MAX_SOURCE_DOCUMENTS_TO_CONVERT_TO_PLAINTEXT_AT_ONE_TIME)
+
+    async def process_file(file_name: str):
+        async with semaphore:
+            source_file_path = os.path.join(original_source_dir, file_name)
+            if not os.path.isfile(source_file_path):
+                logging.warning(f"Skipping {file_name} as it's not a file")
+                return
+
+            base_name = os.path.splitext(file_name)[0]
+            converted_file_path = os.path.join(converted_source_dir, f"{base_name}.txt")
+
+            logging.info(f"Starting conversion of {file_name}")
+            try:
+                # Detect file type using Magika
+                with open(source_file_path, 'rb') as file:
+                    file_content = file.read()
+                    result = magika.identify_bytes(file_content)
+                    detected_mime_type = result.output.mime_type
+                logging.info(f"Detected MIME type for {file_name}: {detected_mime_type}")
+
+                if detected_mime_type.startswith('application/pdf') and robust_needs_ocr(source_file_path):
+                    logging.info(f"PDF {file_name} requires OCR. Starting advanced OCR process...")
+                    images = convert_pdf_to_images_ocr(source_file_path)
+                    logging.info(f"Converted PDF {file_name} to {len(images)} images for OCR")
+                    with ThreadPoolExecutor() as executor:
+                        extracted_text_list = list(executor.map(ocr_image, images))
+                    content = await process_document_ocr(extracted_text_list)
+                    logging.info(f"Completed advanced OCR processing for {file_name}")
+                elif detected_mime_type.startswith('image/'):
+                    logging.info(f"Performing OCR on image {file_name}")
+                    image = Image.open(source_file_path)
+                    extracted_text = ocr_image(image)
+                    content = await process_document_ocr([extracted_text])
+                else:
+                    logging.info(f"Extracting text from {file_name} using textract")
+                    content = textract.process(source_file_path, encoding='utf-8').decode('utf-8')
+
+                # Post-processing
+                logging.info(f"Applying post-processing to extracted text from {file_name}")
+                content = remove_pagination_breaks(content)
+                sentences = sophisticated_sentence_splitter(content)
+                processed_content = "\n".join(sentences)
+
+                with open(converted_file_path, 'w', encoding='utf-8') as f:
+                    f.write(processed_content)
+                logging.info(f"Successfully converted {file_name} to plaintext and saved to {converted_file_path}")
+
+            except Exception as e:
+                logging.error(f"Error converting {file_name}: {str(e)}")
+                logging.error(traceback.format_exc())
+
+    # Process files concurrently
+    file_names = os.listdir(original_source_dir)
+    logging.info(f"Found {len(file_names)} files to process in {original_source_dir}")
+    tasks = [process_file(file_name) for file_name in file_names]
+    await asyncio.gather(*tasks)
+    logging.info("Completed conversion of all documents to plaintext")
+
     
 # Static configuration
-USE_OVERRIDE_DISCOVERY_CONFIG_JSON_FILE = 0  # Set to 1 to use override file
-OVERRIDE_CONFIG_FILE_PATH = "path/to/your/override_config.json"
+MAX_SOURCE_DOCUMENTS_TO_CONVERT_TO_PLAINTEXT_AT_ONE_TIME = 5
+USE_OVERRIDE_DISCOVERY_CONFIG_JSON_FILE = 1  # Set to 1 to use override file
+OVERRIDE_CONFIG_FILE_PATH = "discovery_configuration_json_files/shareholders_vs_enron_corporation.json"
 USER_FREEFORM_TEXT_GOAL_INPUT = """
 We're working on a case involving patent infringement by TechCorp against our client, InnovativeTech. 
 We need to find any communications or documents that discuss TechCorp's knowledge of our client's patent 
@@ -1855,32 +1965,38 @@ async def main():
     file_handler.setLevel(logging.INFO)
     logging.getLogger().addHandler(file_handler)
 
+    # Download Enron sample PDF exhibit files
+    if use_enron_example:
+        logging.info("Now downloading miscellaneous Enron related exhibits as PDFs...")
+        await enron_collector_main()
+        logging.info("Enron sample data collection completed.")
+        
     # Step 2a: Convert source documents to plaintext
-    logging.info("Converting source documents to plaintext")
-    for file_name in os.listdir(original_source_dir):
-        source_file_path = os.path.join(original_source_dir, file_name)
-        if os.path.isfile(source_file_path):
-            try:
-                content = textract.process(source_file_path, encoding='utf-8').decode('utf-8')
-                base_name = os.path.splitext(file_name)[0]
-                converted_file_path = os.path.join(converted_source_dir, f"{base_name}.txt")
-                with open(converted_file_path, 'w', encoding='utf-8') as f:
-                    f.write(content)
-                logging.info(f"Converted {file_name} to plaintext")
-            except Exception as e:
-                logging.error(f"Error converting {file_name}: {str(e)}")
+    logging.info("Now converting source documents to plaintext (and performing OCR if needed)...")
+    await convert_documents_to_plaintext(original_source_dir, converted_source_dir)
                 
     # Step 2b: Process Enron email corpus
     if use_enron_example:
         logging.info("Processing Enron email corpus")
-        enron_dataset_url = "https://tile.loc.gov/storage-services/master/gdc/gdcdatasets/2018487913/2018487913.zip"
+        enron_dataset_url = "https://tile.loc.gov/storage-services/master/gdc/gdcdatasets/2018487913/2018487913.zip"                
+        enron_dataset_dir = os.path.join(project_root, 'enron_email_data')
+        os.makedirs(enron_dataset_dir, exist_ok=True)
+        zip_file_path = os.path.join(enron_dataset_dir, "enron_dataset.zip")
+
+        # Check if the zip file already exists
         logging.info(f"Checking if Enron dataset is already downloaded at {original_source_dir}")
-        if os.path.exists(os.path.join(original_source_dir, "maildir")):
-            logging.info("Enron dataset already downloaded")
-            maildir_path = os.path.join(original_source_dir, "maildir")
+        if os.path.exists(zip_file_path):
+            logging.info("Enron dataset already downloaded. Skipping download.")
         else:
-            logging.info("Enron dataset not found, downloading...")
-            maildir_path = await download_and_extract_enron_emails_dataset(enron_dataset_url, original_source_dir)
+            logging.info("Downloading Enron dataset...")
+            await download_and_extract_enron_emails_dataset(enron_dataset_url, enron_dataset_dir)
+        
+        # Extract the ZIP file directly to the enron_email_data directory
+        with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
+            zip_ref.extractall(enron_dataset_dir)
+
+        # Locate the maildir folder directly under enron_email_data
+        maildir_path = os.path.join(enron_dataset_dir, 'maildir')
         if maildir_path:
             # Process Enron email corpus
             logging.info("Now processing downloaded Enron email corpus")
@@ -1908,10 +2024,6 @@ async def main():
         else:
             logging.error("Failed to locate Enron maildir. Skipping Enron email processing.")                
         
-        logging.info("Now downloading miscellaneous Enron related exhibits as PDFs...")
-        await enron_collector_main()
-        logging.info("Enron sample data collection completed.")
-
     # Load the list of previously processed files
     processed_files_path = os.path.join(project_root, 'processed_files.json')
     processed_files = load_processed_files(processed_files_path)

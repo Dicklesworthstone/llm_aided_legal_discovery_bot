@@ -1,0 +1,47 @@
+{
+  "case_name": "Shareholders vs. Enron Corporation",
+  "discovery_goals": [
+    {
+      "description": "Uncover evidence of deliberate financial misreporting or fraudulent accounting practices.",
+      "keywords": [
+        "financial misreporting",
+        "fraud",
+        "accounting practices"
+      ],
+      "importance": 10
+    },
+    {
+      "description": "Identify communications discussing the creation or use of off-book entities to hide debt or inflate profits.",
+      "keywords": [
+        "off-book entities",
+        "hide debt",
+        "inflate profits"
+      ],
+      "importance": 9
+    },
+    {
+      "description": "Find instances where executives acknowledged financial problems while publicly claiming the company was healthy.",
+      "keywords": [
+        "executives acknowledgment",
+        "financial problems",
+        "public claims"
+      ],
+      "importance": 8
+    },
+    {
+      "description": "Discover any discussions about manipulating energy markets or prices.",
+      "keywords": [
+        "manipulating energy markets",
+        "energy prices"
+      ],
+      "importance": 7
+    }
+  ],
+  "entities_of_interest": [
+    "Enron Corporation",
+    "executives",
+    "shareholders",
+    "regulatory bodies"
+  ],
+  "minimum_importance_score": 7
+}

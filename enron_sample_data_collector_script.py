@@ -3,6 +3,7 @@ import httpx
 from bs4 import BeautifulSoup
 import os
 import logging
+from urllib.parse import urljoin
 from tqdm.asyncio import tqdm
 from httpx import HTTPStatusError, RequestError, TimeoutException
 
@@ -11,16 +12,20 @@ original_source_dir = os.path.join(project_root, 'folder_of_source_documents__or
 
 # Setup logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[logging.FileHandler('enron_downloader.log'), logging.StreamHandler()]
 )
+
+# Lower the verbosity of specific loggers
+httpx_logger = logging.getLogger('httpx')
+httpx_logger.setLevel(logging.WARNING)
 
 # Step 1: Async function to retrieve a webpage with error handling
 async def fetch_page(client, url, retries=3):
     for attempt in range(retries):
         try:
-            response = await client.get(url, timeout=10)
+            response = await client.get(url, timeout=30)  # Increased timeout
             response.raise_for_status()
             return BeautifulSoup(response.text, 'lxml')
         except (HTTPStatusError, RequestError, TimeoutException) as e:
@@ -35,25 +40,35 @@ async def gather_exhibit_urls(main_url, client):
     if soup is None:
         return []
     exhibit_urls = [
-        link['href']
+        urljoin(main_url, link['href'])
         for link in soup.find_all('a', href=True)
-        if 'https://www.justice.gov/archive/enron/exhibit/' in link['href']
+        if 'enron/exhibit/' in link['href']
     ]
     logging.info(f"Found {len(exhibit_urls)} exhibit URLs.")
     return exhibit_urls
 
 # Step 3: Async function to gather all PDF URLs from exhibit pages
 async def gather_pdf_urls(exhibit_urls, client):
-    pdf_urls = []
+    pdf_urls = set()  # Use a set to avoid duplicates
     for exhibit_url in exhibit_urls:
+        logging.info(f"Processing exhibit index page: {exhibit_url}")
         exhibit_soup = await fetch_page(client, exhibit_url)
         if exhibit_soup is None:
             continue
-        for pdf_link in exhibit_soup.find_all('a', href=True):
-            if pdf_link['href'].endswith('.pdf'):
-                pdf_urls.append(pdf_link['href'])
-    logging.info(f"Collected {len(pdf_urls)} PDF URLs.")
-    return pdf_urls
+        exhibit_pdf_urls = []
+        
+        # Find all 'a' tags that contain PDF links
+        for a_tag in exhibit_soup.find_all('a', href=True):
+            if a_tag['href'].lower().endswith('.pdf'):
+                full_url = urljoin(exhibit_url, a_tag['href'])
+                exhibit_pdf_urls.append(full_url)
+                pdf_urls.add(full_url)
+                logging.debug(f"Found PDF URL: {full_url}")
+        
+        logging.info(f"Found {len(exhibit_pdf_urls)} PDF URLs on exhibit index page: {exhibit_url}")
+    
+    logging.info(f"Collected {len(pdf_urls)} unique PDF URLs in total.")
+    return list(pdf_urls)
 
 # Step 4: Async function to download a PDF with a semaphore limit and error handling
 async def download_pdf(sem, client, pdf_url, pbar, retries=3):
@@ -69,7 +84,7 @@ async def download_pdf(sem, client, pdf_url, pbar, retries=3):
         for attempt in range(retries):
             try:
                 pbar.set_description(f"Downloading: {pdf_url}")
-                response = await client.get(pdf_url, timeout=30)
+                response = await client.get(pdf_url, timeout=60)  # Increase timeout
                 response.raise_for_status()
                 with open(pdf_path, 'wb') as pdf_file:
                     pdf_file.write(response.content)
@@ -89,7 +104,19 @@ async def main():
     # Ensure the download directory exists
     os.makedirs(original_source_dir, exist_ok=True)
     
-    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=60.0)) as client:
+    # Check the number of PDF files already downloaded
+    expected_number_of_pdfs = 950
+    existing_pdfs = [
+        f for f in os.listdir(original_source_dir)
+        if os.path.isfile(os.path.join(original_source_dir, f)) and f.lower().endswith('.pdf') and os.path.getsize(os.path.join(original_source_dir, f)) > 25 * 1024
+    ]
+    
+    if len(existing_pdfs) >= expected_number_of_pdfs:
+        logging.info(f"Found {len(existing_pdfs)} PDF files of size at least 25KB in {original_source_dir}.")
+        logging.info("Looks like the files have already been downloaded. Exiting.")
+        return
+    
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=60.0)) as client:
         exhibit_urls = await gather_exhibit_urls(main_url, client)
         if not exhibit_urls:
             logging.error("No exhibit URLs found. Exiting.")
