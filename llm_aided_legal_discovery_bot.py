@@ -68,7 +68,13 @@ magika = Magika() # Initialize Magika
 
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 warnings.filterwarnings("ignore", category=FutureWarning)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%dT%H:%M:%S'  # ISO format
+)
+
 # Create a rate limiter for API requests
 rate_limit = AsyncLimiter(max_rate=60, time_period=60)  # 60 requests per minute
 
@@ -1914,7 +1920,22 @@ async def convert_documents_to_plaintext(original_source_dir: str, converted_sou
                 return
 
             base_name = os.path.splitext(file_name)[0]
-            converted_file_path = os.path.join(converted_source_dir, f"{base_name}.txt")
+            txt_file_path = os.path.join(converted_source_dir, f"{base_name}.txt")
+            md_file_path = os.path.join(converted_source_dir, f"{base_name}.md")
+
+            # Check if converted file already exists
+            if os.path.exists(txt_file_path) or os.path.exists(md_file_path):
+                existing_file = txt_file_path if os.path.exists(txt_file_path) else md_file_path
+                file_size = os.path.getsize(existing_file)
+                
+                if file_size >= 2 * 1024:  # 5 KB
+                    logging.info(f"Skipping {file_name} - already converted ({file_size / 1024:.2f} KB)")
+                    pbar.set_postfix_str(f"Skipped {file_name} (already converted)")
+                    pbar.update(1)
+                    return
+                else:
+                    logging.warning(f"Deleting small converted file: {existing_file} ({file_size / 1024:.2f} KB)")
+                    os.remove(existing_file)
 
             try:
                 pbar.set_postfix_str(f"Processing {file_name}")
@@ -1925,12 +1946,13 @@ async def convert_documents_to_plaintext(original_source_dir: str, converted_sou
                     pbar.update(1)
                     return
                 
-                if used_smart_ocr:
-                    converted_file_path = converted_file_path.replace('.txt', '.md')
+                converted_file_path = md_file_path if used_smart_ocr else txt_file_path
                 
                 with open(converted_file_path, 'w', encoding='utf-8') as f:
                     f.write(processed_text)
                 
+                file_size = os.path.getsize(converted_file_path)
+                logging.info(f"Converted {file_name} ({mime_type}) - Size: {file_size / 1024:.2f} KB")
                 pbar.set_postfix_str(f"Converted {file_name} ({mime_type})")
                 pbar.update(1)
 
@@ -1953,7 +1975,7 @@ async def convert_documents_to_plaintext(original_source_dir: str, converted_sou
     removed_files = 0
     for file_name in os.listdir(converted_source_dir):
         file_path = os.path.join(converted_source_dir, file_name)
-        if file_name.endswith('.txt') and os.path.getsize(file_path) < 1024:  # Less than 1KB
+        if file_name.endswith(('.txt', '.md')) and os.path.getsize(file_path) < 1024:  # Less than 1KB
             logging.warning(f"Removing tiny converted file: {file_path}")
             os.remove(file_path)
             removed_files += 1
