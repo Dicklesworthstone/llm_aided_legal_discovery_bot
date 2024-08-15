@@ -8,6 +8,7 @@ from aiolimiter import AsyncLimiter
 import json
 import re
 import io
+import shutil
 import base64
 import sqlite3
 import zipfile
@@ -53,6 +54,7 @@ except ImportError:
 # Configuration
 config = DecoupleConfig(RepositoryEnv('.env'))
 
+# Global variables controlling the LLM API/model behavior
 USE_LOCAL_LLM = config.get("USE_LOCAL_LLM", default=False, cast=bool)
 API_PROVIDER = config.get("API_PROVIDER", default="OPENAI", cast=str) # OPENAI or CLAUDE
 ANTHROPIC_API_KEY = config.get("ANTHROPIC_API_KEY", default="your-anthropic-api-key", cast=str)
@@ -69,8 +71,7 @@ LOCAL_LLM_CONTEXT_SIZE_IN_TOKENS = 2048
 USE_VERBOSE = False
 
 magika = Magika() # Initialize Magika
-
-openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) # Initialize OpenAI client
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 logging.basicConfig(
@@ -81,7 +82,6 @@ logging.basicConfig(
 
 # Create a rate limiter for API requests
 rate_limit = AsyncLimiter(max_rate=60, time_period=60)  # 60 requests per minute
-
 
 def remove_pagination_breaks(text: str) -> str:
     text = re.sub(r'-(\n)(?=[a-z])', '', text)  # Remove hyphens at the end of lines when the word continues on the next line
@@ -109,14 +109,12 @@ def sophisticated_sentence_splitter(text: str) -> List[str]:
 def parse_email(file_path: str) -> Dict[str, Any]:
     with open(file_path, 'rb') as file:
         msg = BytesParser(policy=default).parse(file)
-    
     headers = {
         'From': msg['from'],
         'To': msg['to'],
         'Subject': msg['subject'],
         'Date': msg['date']
     }
-
     body = ""
     if msg.is_multipart():
         for part in msg.walk():
@@ -127,7 +125,6 @@ def parse_email(file_path: str) -> Dict[str, Any]:
                 break
     else:
         body = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
-
     return {
         'headers': headers,
         'body': body
@@ -136,10 +133,8 @@ def parse_email(file_path: str) -> Dict[str, Any]:
 def parse_enron_email(file_path: str) -> Dict[str, Any]:
     with open(file_path, 'r', encoding='utf-8', errors='ignore') as file:
         content = file.read()
-    
     # Parse the email content
     msg = email.message_from_string(content)
-    
     # Extract basic headers
     headers = {
         'From': msg['from'],
@@ -152,36 +147,30 @@ def parse_enron_email(file_path: str) -> Dict[str, Any]:
         'X-Origin': msg['X-Origin'],
         'X-FileName': msg['X-FileName'],
     }
-    
     # Clean up and normalize headers
     for key, value in headers.items():
         if value:
             headers[key] = ' '.join(value.split())  # Remove extra whitespace
-    
     # Parse the 'From' field to extract name and email
     from_name, from_email = parseaddr(headers['From'])
     headers['From'] = {'name': from_name, 'email': from_email}
-    
     # Parse the 'To' field to extract multiple recipients
     if headers['To']:
         headers['To'] = [{'name': name, 'email': email} for name, email in [parseaddr(addr) for addr in headers['To'].split(',')]]
     else:
         headers['To'] = []
-    
     # Parse the 'Cc' and 'Bcc' fields similarly
     for field in ['Cc', 'Bcc']:
         if headers[field]:
             headers[field] = [{'name': name, 'email': email} for name, email in [parseaddr(addr) for addr in headers[field].split(',')]]
         else:
             headers[field] = []
-    
     # Convert date to a standard format
     if headers['Date']:
         try:
             headers['Date'] = parsedate_to_datetime(headers['Date']).isoformat()
         except:  # noqa: E722
             pass  # Keep the original date string if parsing fails
-    
     # Extract the body
     body = ""
     if msg.is_multipart():
@@ -190,10 +179,8 @@ def parse_enron_email(file_path: str) -> Dict[str, Any]:
                 body += part.get_payload(decode=True).decode('utf-8', errors='ignore')
     else:
         body = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
-    
     # Clean up the body
     body = re.sub(r'\s+', ' ', body).strip()
-    
     return {
         'headers': headers,
         'body': body
@@ -216,7 +203,6 @@ def process_enron_maildir(maildir_path: str) -> List[Dict[str, Any]]:
 async def parse_document_into_sentences(file_path: str, mime_type: str) -> Tuple[List[str], float, Dict[str, Any]]:
     content = ""
     email_metadata = {}
-    
     if mime_type == 'message/rfc822':  # This is an email file
         email_content = parse_email(file_path)
         email_metadata = email_content['headers']
@@ -229,9 +215,7 @@ async def parse_document_into_sentences(file_path: str, mime_type: str) -> Tuple
             logging.error(f"Error while processing file: {e}, mime_type: {mime_type}")
             logging.error(traceback.format_exc())
             raise ValueError(f"Unsupported file type or error: {e}")
-
     sentences = sophisticated_sentence_splitter(content)
-    
     if len(sentences) == 0 and file_path.lower().endswith('.pdf'):
         logging.info("No sentences found, attempting OCR using Tesseract.")
         try:
@@ -242,26 +226,21 @@ async def parse_document_into_sentences(file_path: str, mime_type: str) -> Tuple
             logging.error(f"Error while processing file with OCR: {e}")
             logging.error(traceback.format_exc())
             raise ValueError(f"OCR failed: {e}")
-
     if len(sentences) == 0:
         logging.info("No sentences found in the document")
         raise ValueError("No sentences found in the document")
-
     strings = [s.strip() for s in sentences]
     thousands_of_input_words = round(sum(len(s.split()) for s in strings) / 1000, 2)
     return strings, thousands_of_input_words, email_metadata
 
 async def download_and_extract_enron_emails_dataset(url: str, destination_folder: str):
     zip_file_path = os.path.join(destination_folder, "enron_dataset.zip")
-    
     # Ensure the destination folder exists
     os.makedirs(destination_folder, exist_ok=True)
-    
     # Download the file
     async with httpx.AsyncClient() as client:
         async with client.stream("GET", url) as response:
             total_size = int(response.headers.get("Content-Length", 0))
-            
             with open(zip_file_path, "wb") as file, tqdm(
                 desc="Downloading Enron dataset",
                 total=total_size,
@@ -272,29 +251,117 @@ async def download_and_extract_enron_emails_dataset(url: str, destination_folder
                 async for chunk in response.aiter_bytes():
                     size = file.write(chunk)
                     progress_bar.update(size)
-    
     # Extract the ZIP file
     print("Extracting Enron dataset...")
+    temp_extract_folder = os.path.join(destination_folder, "temp_extract")
+    os.makedirs(temp_extract_folder, exist_ok=True)
     with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
-        zip_ref.extractall(destination_folder)
-    
-    # Remove the ZIP file after extraction
-    os.remove(zip_file_path)
-    print(f"Enron dataset extracted to {destination_folder}")
-
-    # Locate the maildir folder
-    maildir_path = None
-    for root, dirs, files in os.walk(destination_folder):
-        if 'maildir' in dirs:
-            maildir_path = os.path.join(root, 'maildir')
-            break
-    
-    if maildir_path:
-        print(f"Maildir found at: {maildir_path}")
-        return maildir_path
+        zip_ref.extractall(temp_extract_folder)
+    # Move the maildir folder to the correct location
+    extracted_maildir = os.path.join(temp_extract_folder, '2018487913', 'maildir')
+    final_maildir = os.path.join(destination_folder, 'maildir')
+    if os.path.exists(extracted_maildir):
+        if os.path.exists(final_maildir):
+            shutil.rmtree(final_maildir)
+        shutil.move(extracted_maildir, final_maildir)
+        print(f"Maildir moved to: {final_maildir}")
     else:
         print("Maildir not found in the extracted dataset")
+    # Clean up
+    shutil.rmtree(temp_extract_folder)
+    os.remove(zip_file_path)
+    print("Enron dataset extracted and cleaned up")
+    if os.path.exists(final_maildir):
+        return final_maildir
+    else:
+        print("Failed to locate the final Maildir")
         return None
+
+async def process_enron_email_corpus(
+    project_root: str,
+    original_source_dir: str,
+    converted_source_dir: str,
+    turn_enron_email_archive_into_individual_converted_markdown_files_per_sender: bool = False
+):
+    logging.info("Processing Enron email corpus")
+    enron_dataset_url = "https://tile.loc.gov/storage-services/master/gdc/gdcdatasets/2018487913/2018487913.zip"                
+    enron_dataset_dir = os.path.join(project_root, 'enron_email_data')
+    os.makedirs(enron_dataset_dir, exist_ok=True)
+    zip_file_path = os.path.join(enron_dataset_dir, "enron_dataset.zip")
+    maildir_path = os.path.join(enron_dataset_dir, 'maildir')
+    # Check if the maildir already contains the expected number of subdirectories
+    if os.path.exists(maildir_path):
+        subdirs = [d for d in os.listdir(maildir_path) if os.path.isdir(os.path.join(maildir_path, d))]
+        if len(subdirs) == 150:
+            logging.info("Enron email corpus already extracted and present. Skipping download and extraction.")
+            return process_extracted_emails(maildir_path, converted_source_dir, turn_enron_email_archive_into_individual_converted_markdown_files_per_sender)
+    # If we don't have the complete extracted data, proceed with download and extraction
+    if not os.path.exists(zip_file_path):
+        logging.info("Downloading Enron dataset...")
+        await download_and_extract_enron_emails_dataset(enron_dataset_url, enron_dataset_dir)
+    else:
+        logging.info("Enron dataset zip file already downloaded. Proceeding to extraction.")
+    logging.info("Extracting Enron dataset...")
+    with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
+        for member in zip_ref.namelist():
+            filename = os.path.basename(member)
+            if not filename:
+                continue
+            source = zip_ref.open(member)
+            target = open(os.path.join(enron_dataset_dir, filename), "wb")
+            with source, target:
+                shutil.copyfileobj(source, target)
+    # Move maildir to correct location (removing the '2018487913' part)
+    temp_maildir = os.path.join(enron_dataset_dir, '2018487913', 'maildir')
+    if os.path.exists(temp_maildir):
+        if os.path.exists(maildir_path):
+            shutil.rmtree(maildir_path)
+        shutil.move(temp_maildir, maildir_path)
+        shutil.rmtree(os.path.join(enron_dataset_dir, '2018487913'))
+    if not os.path.exists(maildir_path):
+        logging.error("Failed to locate Enron maildir after extraction. Skipping Enron email processing.")
+        return
+    return process_extracted_emails(maildir_path, converted_source_dir, turn_enron_email_archive_into_individual_converted_markdown_files_per_sender)
+
+def process_extracted_emails(maildir_path, converted_source_dir, turn_enron_email_archive_into_individual_converted_markdown_files_per_sender):
+    logging.info("Now processing extracted Enron email corpus")
+    enron_emails = process_enron_maildir(maildir_path)
+    if turn_enron_email_archive_into_individual_converted_markdown_files_per_sender:
+        sender_emails = {}
+        for email_data in enron_emails:
+            sender = email_data['headers']['From']['email']
+            if sender not in sender_emails:
+                sender_emails[sender] = []
+            sender_emails[sender].append(email_data)
+        for sender, emails in sender_emails.items():
+            markdown_content = ""
+            for email_data in emails:
+                markdown_content += f"From: {email_data['headers']['From']['name']} <{email_data['headers']['From']['email']}>\n"
+                markdown_content += f"To: {', '.join([f'{r['name']} <{r['email']}>' for r in email_data['headers']['To']])}\n"
+                markdown_content += f"Subject: {email_data['headers']['Subject']}\n"
+                markdown_content += f"Date: {email_data['headers']['Date']}\n\n"
+                markdown_content += email_data['body']
+                markdown_content += "\n\n---\n\n"
+            safe_sender = ''.join(c if c.isalnum() else '_' for c in sender)
+            markdown_file_path = os.path.join(converted_source_dir, f"{safe_sender}_emails.md")
+            with open(markdown_file_path, 'w', encoding='utf-8') as f:
+                f.write(markdown_content)
+            logging.info(f"Created markdown file for sender: {sender}")
+    else:
+        for email_data in enron_emails:
+            file_path = email_data['file_path']
+            content = f"From: {email_data['headers']['From']['name']} <{email_data['headers']['From']['email']}>\n"
+            content += f"To: {', '.join([f'{r['name']} <{r['email']}>' for r in email_data['headers']['To']])}\n"
+            content += f"Subject: {email_data['headers']['Subject']}\n"
+            content += f"Date: {email_data['headers']['Date']}\n\n"
+            content += email_data['body']
+            base_name = os.path.relpath(file_path, maildir_path).replace('/', '_')
+            converted_file_path = os.path.join(converted_source_dir, f"{base_name}.txt")
+            os.makedirs(os.path.dirname(converted_file_path), exist_ok=True)
+            with open(converted_file_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            logging.info(f"Converted Enron email: {file_path}")
+    logging.info("Finished processing Enron email corpus")
 
 
 ##########################################################################
@@ -306,15 +373,12 @@ def robust_needs_ocr(file_path: str) -> bool:
     Determine if a file needs OCR using multiple methods.
     """
     logging.info(f"Checking if {file_path} needs OCR")
-    
     # For PDFs
     if file_path.lower().endswith('.pdf'):
         return needs_ocr_pdf(file_path)
-    
     # For images
     if file_path.lower().endswith(('.png', '.jpg', '.jpeg', '.tiff', '.bmp', '.gif')):
         return True
-    
     # For other file types, assume no OCR needed
     return False
 
@@ -323,44 +387,33 @@ def needs_ocr_pdf(pdf_path: str) -> bool:
     Check if a PDF needs OCR by attempting multiple methods of text extraction.
     """
     logging.info(f"Checking if PDF {pdf_path} needs OCR")
-    
     try:
         with open(pdf_path, 'rb') as file:
             reader = PyPDF2.PdfReader(file)
-            
             # Check a sample of pages (e.g., first, middle, and last if available)
             pages_to_check = [0, len(reader.pages) // 2, -1]
             for page_num in pages_to_check:
                 if page_num < len(reader.pages):
                     page = reader.pages[page_num]
                     text = page.extract_text()
-                    
                     # If we find meaningful text, no OCR needed
                     if len(text.strip()) > 50:  # Adjust threshold as needed
                         logging.info(f"Found sufficient text in PDF {pdf_path} on page {page_num+1}. OCR not needed.")
                         return False
-    
     except Exception as e:
         logging.error(f"Error checking PDF {pdf_path}: {str(e)}")
-    
     logging.info(f"PDF {pdf_path} likely needs OCR.")
     return True
 
 def perform_simple_ocr_on_image(image_path: str) -> str:
-    """
-    Perform OCR on a single image.
-    """
     logging.info(f"Performing OCR on image: {image_path}")
     image = cv2.imread(image_path)
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    
     # Apply thresholding to preprocess the image
     gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
-    
     # Apply dilation to connect text components
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
     gray = cv2.dilate(gray, kernel, iterations=1)
-    
     # Perform text extraction
     text = pytesseract.image_to_string(gray)
     return text
@@ -368,7 +421,8 @@ def perform_simple_ocr_on_image(image_path: str) -> str:
 def preprocess_image_ocr(image):
     gray = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2GRAY)
     gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
-    kernel = np.ones((1, 1), np.uint8)
+    # Apply dilation to connect text components
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
     gray = cv2.dilate(gray, kernel, iterations=1)
     return Image.fromarray(gray)
 
@@ -394,16 +448,12 @@ def escape_special_characters(text):
 
 async def process_chunk_ocr(chunk: str, prev_context: str, chunk_index: int, total_chunks: int, reformat_as_markdown: bool, suppress_headers_and_page_numbers: bool) -> Tuple[str, str]:
     logging.info(f"Processing OCR chunk {chunk_index + 1}/{total_chunks} (length: {len(chunk):,} characters)")
-    
     # Check if the chunk has enough content
     if len(chunk.strip()) < 50:
         logging.warning(f"Skipping chunk {chunk_index + 1}/{total_chunks} due to insufficient content (less than 50 characters)")
         return "", prev_context
-    
-    # Reduce context size
     context_length = min(250, len(prev_context))
     prev_context_short = prev_context[-context_length:]
-    
     # Function to process text in smaller parts
     async def process_text(text: str, prompt_template: str, max_chunk_size: int = 1000) -> str:
         text = escape_special_characters(text)
@@ -412,7 +462,6 @@ async def process_chunk_ocr(chunk: str, prev_context: str, chunk_index: int, tot
             prompt = prompt_template.format(text=text, prev_context=prev_context_short)
             max_tokens = min(2048, 4096 - estimate_tokens(prompt, model_name))
             return await generate_completion(prompt, max_tokens=max_tokens)
-        
         parts = []
         words = text.split()
         current_part = []
@@ -430,16 +479,13 @@ async def process_chunk_ocr(chunk: str, prev_context: str, chunk_index: int, tot
             else:
                 current_part.append(word)
                 current_tokens += word_tokens
-        
         if current_part:
             part_text = " ".join(current_part)
             prompt = prompt_template.format(text=part_text, prev_context=prev_context_short)
             max_tokens = min(2048, 4096 - estimate_tokens(prompt, model_name))
             processed_part = await generate_completion(prompt, max_tokens=max_tokens)
             parts.append(processed_part)
-        
         return " ".join(parts)
-    
     # OCR correction prompt template
     ocr_correction_template = """Correct OCR-induced errors in the text, ensuring it flows coherently with the previous context. Follow these guidelines:
 
@@ -529,16 +575,13 @@ Text to filter:
 Filtered text:
 """
     filtered_chunk = await process_text(processed_chunk, filtering_template)
-
     # Check if the final output is reasonably long
     if len(filtered_chunk.strip()) < 100:
         logging.warning(f"Chunk {chunk_index + 1}/{total_chunks} output is too short (less than 100 characters). This may indicate a processing issue.")
         return "", prev_context
-
     # Use dynamic context length for the next chunk
     new_context_length = min(500, len(filtered_chunk))
     new_context = filtered_chunk[-new_context_length:]
-
     logging.info(f"OCR Chunk {chunk_index + 1}/{total_chunks} processed. Output length: {len(filtered_chunk):,} characters")
     return filtered_chunk, new_context
 
@@ -547,13 +590,11 @@ async def process_chunks_ocr(chunks: List[str], reformat_as_markdown: bool = Tru
     async def process_chunk_with_context(chunk: str, prev_context: str, index: int) -> Tuple[int, str, str]:
         processed_chunk, new_context = await process_chunk_ocr(chunk, prev_context, index, total_chunks, reformat_as_markdown, suppress_headers_and_page_numbers)
         return index, processed_chunk, new_context
-    
     context = ""
     processed_chunks = []
     for i, chunk in enumerate(chunks):
         processed_chunk, context = await process_chunk_ocr(chunk, context, i, total_chunks, reformat_as_markdown, suppress_headers_and_page_numbers)
         processed_chunks.append(processed_chunk)
-    
     logging.info(f"All {total_chunks} OCR chunks processed successfully")
     return processed_chunks
 
@@ -561,9 +602,7 @@ async def process_document_ocr(list_of_extracted_text_strings: List[str], reform
     logging.info(f"Starting OCR document processing. Total pages: {len(list_of_extracted_text_strings):,}")
     full_text = "\n\n".join(list_of_extracted_text_strings)
     logging.info(f"Size of full OCR text before processing: {len(full_text):,} characters")
-    
     chunk_size, overlap = 8000, 10
-    # Improved chunking logic
     paragraphs = re.split(r'\n\s*\n', full_text)
     chunks = []
     current_chunk = []
@@ -598,7 +637,6 @@ async def process_document_ocr(list_of_extracted_text_strings: List[str], reform
         overlap_text = chunks[i-1].split()[-overlap:]
         chunks[i] = " ".join(overlap_text) + " " + chunks[i]
     logging.info(f"OCR document split into {len(chunks):,} chunks. Chunk size: {chunk_size:,}, Overlap: {overlap:,}")
-    
     # Process chunks with error handling
     processed_chunks = []
     for i, chunk in enumerate(chunks):
@@ -613,14 +651,13 @@ async def process_document_ocr(list_of_extracted_text_strings: List[str], reform
             # Append original chunk if processing fails
             processed_chunks.append(chunk)
             logging.warning(f"Using original chunk for {i+1}/{len(chunks)} due to processing error")
-    
     final_text = "".join(processed_chunks)
     logging.info(f"Size of OCR text after combining chunks: {len(final_text):,} characters")
     logging.info(f"OCR document processing complete. Final text length: {len(final_text):,} characters")
     return final_text
 
 ##########################################################################
-# Prompt Templates
+# Legal Discovery Prompt Templates
 ##########################################################################
 
 # Document Identification
@@ -889,7 +926,7 @@ def is_gpu_available():
         logging.error(f"Error checking GPU availability: {e}")
         return {"gpu_found": False, "num_gpus": 0, "first_gpu_vram": 0, "total_vram": 0, "error": str(e)}
 
-# Model Download
+# Local LLM Model Download
 async def download_models() -> Tuple[List[str], List[Dict[str, str]]]:
     download_status = []    
     model_url = "https://huggingface.co/Orenguteng/Llama-3.1-8B-Lexi-Uncensored-GGUF/resolve/main/Llama-3.1-8B-Lexi-Uncensored_Q5_fixedrope.gguf"
@@ -927,7 +964,7 @@ async def download_models() -> Tuple[List[str], List[Dict[str, str]]]:
     logging.info("Model download process completed.")
     return [model_name], download_status
 
-# Model Loading
+# Local LLM Model Loading
 def load_model(llm_model_name: str, raise_exception: bool = True):
     global USE_VERBOSE
     try:
@@ -1049,7 +1086,6 @@ def chunk_text(text: str, max_chunk_tokens: int, model_name: str) -> List[str]:
     sentences = re.split(r'(?<=[.!?])\s+', text)
     current_chunk = []
     current_chunk_tokens = 0
-    
     for sentence in sentences:
         sentence_tokens = len(tokenizer.encode(sentence))
         if sentence_tokens > max_chunk_tokens:
@@ -1071,10 +1107,8 @@ def chunk_text(text: str, max_chunk_tokens: int, model_name: str) -> List[str]:
         else:
             current_chunk.append(sentence)
             current_chunk_tokens += sentence_tokens
-    
     if current_chunk:
         chunks.append(' '.join(current_chunk))
-    
     return chunks
 
 def split_long_sentence(sentence: str, max_tokens: int, model_name: str) -> List[str]:
@@ -1083,7 +1117,6 @@ def split_long_sentence(sentence: str, max_tokens: int, model_name: str) -> List
     current_chunk = []
     current_chunk_tokens = 0
     tokenizer = get_tokenizer(model_name)
-    
     for word in words:
         word_tokens = len(tokenizer.encode(word))
         if current_chunk_tokens + word_tokens > max_tokens and current_chunk:
@@ -1093,10 +1126,8 @@ def split_long_sentence(sentence: str, max_tokens: int, model_name: str) -> List
         else:
             current_chunk.append(word)
             current_chunk_tokens += word_tokens
-    
     if current_chunk:
         chunks.append(' '.join(current_chunk))
-    
     return chunks
 
 def adjust_overlaps(chunks: List[str], tokenizer, max_chunk_tokens: int, overlap_size: int = 50) -> List[str]:
@@ -1112,7 +1143,6 @@ def adjust_overlaps(chunks: List[str], tokenizer, max_chunk_tokens: int, overlap
                 adjusted_chunks.append(' '.join(overlap_adjusted))
             else:
                 adjusted_chunks.append(' '.join(chunks[i-1].split()[-overlap_size:] + chunks[i].split()))
-    
     return adjusted_chunks
 
 async def generate_completion_from_claude(prompt: str, max_tokens: int = CLAUDE_MAX_TOKENS - TOKEN_BUFFER) -> Optional[str]:
@@ -1272,13 +1302,11 @@ def calculate_importance_score(importance_analysis: str) -> dict:
     sub_scores = {}
     pattern = r'(\w+)_SCORE: (\d+)\n(\w+)_JUSTIFICATION: (.+)'
     matches = re.findall(pattern, importance_analysis, re.MULTILINE)
-    
     for match in matches:
         category = match[0].lower()
         score = int(match[1])
         justification = match[3].strip()
         sub_scores[category] = {"score": score, "justification": justification}
-    
     # Define weights for each category
     weights = {
         "relevance": 0.3,
@@ -1288,28 +1316,23 @@ def calculate_importance_score(importance_analysis: str) -> dict:
         "credibility": 0.1,
         "uniqueness": 0.1
     }
-    
     # Calculate weighted average
     total_score = sum(sub_scores[category]["score"] * weights[category] for category in weights)
-    
     # Round to two decimal places
     final_score = round(total_score, 2)
-    
     # Prepare detailed breakdown
     breakdown = {
         "final_score": final_score,
         "sub_scores": sub_scores,
         "explanation": f"The final importance score of {final_score} is a weighted average of the sub-scores, "
-                       f"with the following weights: {weights}"
+                        f"with the following weights: {weights}"
     }
-    
     return breakdown
 
 async def process_chunk_multi_stage(chunk, chunk_index, total_chunks, discovery_params):
     try:
         # Stage 1: Document Identification
         doc_info = await generate_completion(doc_id_prompt.format(document_excerpt=chunk, entities_of_interest=discovery_params['entities_of_interest']))
-        
         # Stage 2: Relevance Check
         relevance_analysis = await generate_completion(relevance_check_prompt.format(
             discovery_goals=discovery_params['discovery_goals'],
@@ -1318,11 +1341,9 @@ async def process_chunk_multi_stage(chunk, chunk_index, total_chunks, discovery_
             keywords=discovery_params['keywords'],
             entities_of_interest=discovery_params['entities_of_interest']
         ))
-        
         # If not relevant, stop processing this chunk
         if 'RELEVANT: No' in relevance_analysis:
             return None
-        
         # Parallel processing stages
         extract_task = asyncio.create_task(generate_completion(extract_gen_prompt.format(
             relevance_analysis=relevance_analysis,
@@ -1331,7 +1352,6 @@ async def process_chunk_multi_stage(chunk, chunk_index, total_chunks, discovery_
             keywords=discovery_params['keywords'],
             entities_of_interest=discovery_params['entities_of_interest']
         )))
-        
         tag_task = asyncio.create_task(generate_completion(tag_gen_prompt.format(
             doc_info=doc_info,
             relevance_analysis=relevance_analysis,
@@ -1339,10 +1359,8 @@ async def process_chunk_multi_stage(chunk, chunk_index, total_chunks, discovery_
             keywords=discovery_params['keywords'],
             entities_of_interest=discovery_params['entities_of_interest']
         )))
-        
         # Wait for parallel tasks to complete
         key_extracts, tags = await asyncio.gather(extract_task, tag_task)
-        
         # Sequential stages that depend on previous results
         explanation = await generate_completion(explanation_gen_prompt.format(
             discovery_goals=discovery_params['discovery_goals'],
@@ -1352,7 +1370,6 @@ async def process_chunk_multi_stage(chunk, chunk_index, total_chunks, discovery_
             keywords=discovery_params['keywords'],
             entities_of_interest=discovery_params['entities_of_interest']
         ))
-        
         # Importance Score Generation
         importance_analysis = await generate_completion(importance_score_prompt.format(
             doc_info=doc_info,
@@ -1364,9 +1381,7 @@ async def process_chunk_multi_stage(chunk, chunk_index, total_chunks, discovery_
             keywords_found=discovery_params['keywords'],
             entities_mentioned=discovery_params['entities_of_interest']
         ))
-        
         importance_score = calculate_importance_score(importance_analysis)
-        
         # Final stage: Dossier Section Compilation
         dossier_section = await generate_completion(dossier_section_prompt.format(
             doc_info=doc_info,
@@ -1379,7 +1394,6 @@ async def process_chunk_multi_stage(chunk, chunk_index, total_chunks, discovery_
             keywords_found=discovery_params['keywords'],
             entities_mentioned=discovery_params['entities_of_interest']
         ))
-        
         return {
             "doc_info": doc_info,
             "relevance": relevance_analysis,
@@ -1408,7 +1422,6 @@ def chunk_transcription(transcription: List[Dict], chunk_size: int = 10, overlap
 async def process_long_text(text: str, max_chunk_size: int = 2000) -> str:
     chunks = [text[i:i+max_chunk_size] for i in range(0, len(text), max_chunk_size)]
     processed_chunks = []
-    
     for i, chunk in enumerate(chunks):
         logging.info(f"Processing long text chunk {i+1}/{len(chunks)}")
         prompt = f"""Refine and improve the following chunk of text, ensuring consistency in formatting and content:
@@ -1433,7 +1446,6 @@ def compile_dossier_section(processed_chunks: List[Dict[str, Any]], document_id:
     """
     if not processed_chunks:
         return None
-
     # Initialize the merged data
     merged_data = {
         "document_id": document_id,
@@ -1445,7 +1457,6 @@ def compile_dossier_section(processed_chunks: List[Dict[str, Any]], document_id:
         "explanations": set(),
         "importance_scores": []
     }
-
     # Merge data from all chunks
     for chunk in processed_chunks:
         merged_data["relevance"].extend(chunk["relevance"].split(", "))
@@ -1453,25 +1464,19 @@ def compile_dossier_section(processed_chunks: List[Dict[str, Any]], document_id:
         merged_data["tags"].update(chunk["tags"].split(", "))
         merged_data["explanations"].add(chunk["explanation"])
         merged_data["importance_scores"].append(chunk["importance_score"])
-
     # Process and deduplicate relevance
     relevance_counter = Counter(merged_data["relevance"])
     merged_data["relevance"] = [{"goal": goal, "frequency": count} for goal, count in relevance_counter.items()]
     merged_data["relevance"].sort(key=lambda x: x["frequency"], reverse=True)
-
     # Deduplicate and sort key extracts
     merged_data["key_extracts"] = sorted(set(merged_data["key_extracts"]), key=lambda x: merged_data["key_extracts"].index(x))
-
     # Sort tags by frequency
     tag_counter = Counter(merged_data["tags"])
     merged_data["tags"] = [{"tag": tag, "frequency": count} for tag, count in tag_counter.most_common()]
-
     # Combine explanations
     merged_data["explanation"] = " ".join(merged_data["explanations"])
-
     # Calculate the overall importance score
     overall_importance = sum(score["final_score"] for score in merged_data["importance_scores"]) / len(merged_data["importance_scores"])
-
     # Aggregate sub-scores
     aggregated_sub_scores = {
         category: {
@@ -1480,10 +1485,8 @@ def compile_dossier_section(processed_chunks: List[Dict[str, Any]], document_id:
         }
         for category in merged_data["importance_scores"][0]["sub_scores"].keys()
     }
-
     # Generate a concise summary
     summary = generate_summary(merged_data, discovery_params, overall_importance)
-
     # Compile the final dossier section
     dossier_section = f"""## Document: {merged_data['doc_info']['TYPE']} - {merged_data['doc_info']['SUBJECT']}
 
@@ -1520,7 +1523,6 @@ def compile_dossier_section(processed_chunks: List[Dict[str, Any]], document_id:
 - **File Path:** {file_path}
 - **Chunks Processed:** {len(processed_chunks)}
 """
-
     return {
         "document_id": document_id,
         "file_path": file_path,
@@ -1533,14 +1535,12 @@ def generate_summary(merged_data: Dict[str, Any], discovery_params: Dict[str, An
     """Generate a concise summary of the document's relevance and importance."""
     top_goals = ", ".join([goal["goal"] for goal in merged_data["relevance"][:3]])
     top_tags = ", ".join([tag["tag"] for tag in merged_data["tags"][:5]])
-    
     summary = f"This {merged_data['doc_info']['TYPE'].lower()} is primarily relevant to the following discovery goals: {top_goals}. "
     summary += f"Key topics include: {top_tags}. "
     summary += f"The document's overall importance score is {overall_importance:.2f} out of 100, "
     summary += f"indicating {'high' if overall_importance > 75 else 'moderate' if overall_importance > 50 else 'low'} relevance to the case. "
     summary += f"Created on {merged_data['doc_info']['DATE']}, "
     summary += f"this document involves communication between {merged_data['doc_info']['AUTHOR']} and {merged_data['doc_info']['RECIPIENT']}."
-
     return summary
 
 def format_relevance(relevance: List[Dict[str, Any]], discovery_params: Dict[str, Any]) -> str:
@@ -1580,7 +1580,6 @@ def format_importance_breakdown(sub_scores: Dict[str, Dict[str, Any]], overall_i
     for category, details in sub_scores.items():
         breakdown += f"- **{category.capitalize()}**: {details['score']:.2f}\n"
         breakdown += f"  - Justification: {'; '.join(set(details['justifications']))}\n"
-    
     breakdown += f"\nThe overall importance score of {overall_importance:.2f} is a weighted average of these sub-scores."
     return breakdown
 
@@ -1591,54 +1590,42 @@ def chunk_document(document_text: str, chunk_size: int = 2000, overlap: int = 20
     chunks = []
     start = 0
     text_length = len(document_text)
-
     while start < text_length:
         end = start + chunk_size
-        
         # If this is not the last chunk, try to break at a sentence boundary
         if end < text_length:
             # Look for the last sentence boundary within the overlap region
             last_period = document_text.rfind('.', end - overlap, end)
             if last_period != -1:
                 end = last_period + 1  # Include the period in this chunk
-        
         chunk = document_text[start:end].strip()
         chunks.append(chunk)
-        
         # Move the start point, ensuring there's overlap
         start = max(start + chunk_size - overlap, end - overlap)
-
     return chunks
 
 async def process_document_for_discovery(file_path: str, discovery_params: Dict[str, Any], semaphore: asyncio.Semaphore) -> Dict[str, Any]:
     logging.info(f"Processing file: {file_path}")
-
     with open(file_path, 'rb') as file:
         file_content = file.read()
         result = magika.identify_bytes(file_content)
         detected_mime_type = result.output.mime_type
-
     document_id = hashlib.sha256(file_content).hexdigest()
-
     try:
         processed_text, _, metadata, _ = await preprocess_document(file_path)
         sentences = sophisticated_sentence_splitter(processed_text)
     except ValueError as e:
         logging.error(f"Error parsing document {file_path}: {str(e)}")
         return None
-
     chunk_size = 10
     chunks = [sentences[i:i + chunk_size] for i in range(0, len(sentences), chunk_size)]
-
     async def process_chunk(chunk, i):
         async with semaphore:
             chunk_text = " ".join(chunk)
             return await process_chunk_multi_stage(chunk_text, i, len(chunks), discovery_params)
-
     with ThreadPoolExecutor() as executor:
         loop = asyncio.get_event_loop()
         chunk_results = await asyncio.gather(*[loop.run_in_executor(executor, lambda: asyncio.run(process_chunk(chunk, i))) for i, chunk in enumerate(chunks)])
-    
     processed_chunks = []
     low_importance_chunks = []
     for chunk_result in chunk_results:
@@ -1648,16 +1635,12 @@ async def process_document_for_discovery(file_path: str, discovery_params: Dict[
                 processed_chunks.append(chunk_result)
             else:
                 low_importance_chunks.append(chunk_result)
-
     if not processed_chunks and not low_importance_chunks:
         logging.info(f"Document {file_path} did not yield any relevant information.")
         return None
-
     dossier_section = compile_dossier_section(processed_chunks, document_id, file_path, discovery_params)
     low_importance_section = compile_dossier_section(low_importance_chunks, document_id, file_path, discovery_params)
-
     thousands_of_input_words = round(sum(len(s.split()) for s in sentences) / 1000, 2)
-
     result = {
         'document_id': document_id,
         'file_path': file_path,
@@ -1672,17 +1655,14 @@ async def process_document_for_discovery(file_path: str, discovery_params: Dict[
             'file_size_bytes': os.path.getsize(file_path)
         }
     }
-
     # Add email metadata if the file is an email
     if metadata:
         result['metadata'].update(metadata)
-
     return result
 
 async def generate_discovery_config(user_input: str) -> str:
     async def call_llm(prompt: str) -> str:
         return await generate_completion(prompt)
-
     # Step 1: Generate JSON configuration from user input
     json_generation_prompt = f"""
     Based on the following user input about their discovery goals and case summary, generate a comprehensive JSON configuration file for legal discovery automation. The JSON should include the following fields:
@@ -1702,9 +1682,7 @@ async def generate_discovery_config(user_input: str) -> str:
 
     Generate the JSON configuration:
     """
-
     json_config = await call_llm(json_generation_prompt)
-
     # Step 2: Validate and fix the JSON structure with retry logic
     validation_prompt_template = """
     The following is a JSON configuration for legal discovery automation. Please verify that it follows the required structure and fix any issues:
@@ -1729,7 +1707,6 @@ async def generate_discovery_config(user_input: str) -> str:
 
     Provide the corrected JSON below; IMPORTANT: DO NOT REMOVE OR ABBREVIATE ANY CONTENT FROM THE JSON DATA!!! AND ONLY RESPOND WITH THE CORRECTED JSON, DO NOT ADD ANY EXTRA INFORMATION OR ANY OTHER TEXT, NOT EVEN MARKDOWN CODE BLOCKS:
     """
-    
     MAX_RETRIES = 5
     retries = 0
     while retries < MAX_RETRIES:
@@ -1747,7 +1724,6 @@ async def generate_discovery_config(user_input: str) -> str:
         json_config = corrected_json  # Update with the latest version from the LLM
     else:
         raise ValueError("Exceeded maximum retries to generate a valid JSON configuration.")
-
     # Step 3: Generate a descriptive file name
     file_name_prompt = f"""
     Based on the following case information, generate a short, descriptive file name for the JSON configuration file. Use only lowercase letters and underscores, and end the file name with '.json'.
@@ -1757,12 +1733,10 @@ async def generate_discovery_config(user_input: str) -> str:
 
     Generate file name (ONLY RESPOND WITH THE CORRECTED FILE NAME, DO NOT ADD ANY EXTRA INFORMATION OR ANY OTHER TEXT, NOT EVEN MARKDOWN CODE BLOCKS):
     """
-
     file_name = await call_llm(file_name_prompt)
     file_name = re.sub(r'[^a-z_.]', '', file_name.strip().lower())
     if not file_name.endswith('.json'):
         file_name += '.json'
-        
     # Step 4: Save the JSON file
     config_folder = 'discovery_configuration_json_files'
     os.makedirs(config_folder, exist_ok=True)
@@ -1776,13 +1750,10 @@ def validate_config_structure(config: Dict[str, Any]):
     required_fields = {'case_name', 'discovery_goals', 'entities_of_interest', 'minimum_importance_score'}
     if not all(field in config for field in required_fields):
         raise ValueError("Missing required fields in the configuration.")
-
     if not isinstance(config['case_name'], str):
         raise ValueError("case_name must be a string.")
-
     if not isinstance(config['discovery_goals'], list):
         raise ValueError("discovery_goals must be a list.")
-
     for goal in config['discovery_goals']:
         if not all(field in goal for field in ['description', 'keywords', 'importance']):
             raise ValueError("Each discovery goal must have description, keywords, and importance.")
@@ -1792,33 +1763,26 @@ def validate_config_structure(config: Dict[str, Any]):
             raise ValueError("Goal keywords must be a list of strings.")
         if not isinstance(goal['importance'], (int, float)) or not 1 <= goal['importance'] <= 10:
             raise ValueError("Goal importance must be a number between 1 and 10.")
-
     if not isinstance(config['entities_of_interest'], list) or not all(isinstance(e, str) for e in config['entities_of_interest']):
         raise ValueError("entities_of_interest must be a list of strings.")
-
     if not isinstance(config['minimum_importance_score'], (int, float)) or not 0 <= config['minimum_importance_score'] <= 100:
         raise ValueError("minimum_importance_score must be a number between 0 and 100.")
 
 def compile_final_dossier(dossier_sections: List[Dict[str, Any]]) -> str:
     # Sort dossier sections by importance score in descending order
     sorted_sections = sorted(dossier_sections, key=lambda x: x['importance_score'], reverse=True)
-
     # Compile the final dossier
     final_dossier = "# Legal Discovery Dossier\n\n"
     final_dossier += f"Total Documents Processed: {len(sorted_sections)}\n\n"
     final_dossier += "## Table of Contents\n\n"
-
     for i, section in enumerate(sorted_sections, 1):
         doc_title = f"{section['doc_info']['TYPE']} - {section['doc_info']['SUBJECT']}"
         final_dossier += f"{i}. [{doc_title}](#{i}-{doc_title.lower().replace(' ', '-')})\n"
-
     final_dossier += "\n## Document Summaries\n\n"
-
     for i, section in enumerate(sorted_sections, 1):
         final_dossier += f"### {i}. {section['doc_info']['TYPE']} - {section['doc_info']['SUBJECT']}\n\n"
         final_dossier += section['dossier_section']
         final_dossier += "\n---\n\n"
-
     return final_dossier
     
 def process_document_wrapper(file_path: str, discovery_params: Dict[str, Any], converted_source_dir: str, semaphore: asyncio.Semaphore):
@@ -1834,7 +1798,6 @@ def process_document_wrapper(file_path: str, discovery_params: Dict[str, Any], c
         except Exception as e:
             logging.error(f"Error processing {os.path.basename(file_path)}: {str(e)}")
         return None
-
     return asyncio.run(_process())
 
 def get_file_hash(file_path: str) -> str:
@@ -1849,19 +1812,15 @@ def get_file_hash(file_path: str) -> str:
 def manage_processed_files(directory: str, processed_files: Dict[str, str]) -> List[str]:
     files_to_process = []
     current_files = {}
-
     for root, _, files in os.walk(directory):
         for file in files:
             file_path = os.path.join(root, file)
             file_hash = get_file_hash(file_path)
             current_files[file_path] = file_hash
-
             if file_path not in processed_files or processed_files[file_path] != file_hash:
                 files_to_process.append(file_path)
-
     # Remove files that no longer exist
     processed_files = {k: v for k, v in processed_files.items() if k in current_files}
-
     return files_to_process
 
 def save_processed_files(processed_files: Dict[str, str], save_path: str):
@@ -1879,9 +1838,7 @@ async def preprocess_document(file_path: str) -> Tuple[str, str, Dict[str, Any]]
         file_content = file.read()
         result = magika.identify_bytes(file_content)
         detected_mime_type = result.output.mime_type
-    
     logging.info(f"Detected MIME type for {file_path}: {detected_mime_type}")
-    
     metadata = {}
     used_smart_ocr = False
     if detected_mime_type.startswith('application/pdf') and robust_needs_ocr(file_path):
@@ -1902,19 +1859,16 @@ async def preprocess_document(file_path: str) -> Tuple[str, str, Dict[str, Any]]
     else:
         logging.info(f"Extracting text from {file_path} using textract")
         extracted_text = textract.process(file_path, encoding='utf-8').decode('utf-8')
-    
     # Post-processing
     extracted_text = remove_pagination_breaks(extracted_text)
     sentences = sophisticated_sentence_splitter(extracted_text)
     processed_text = "\n".join(sentences)
-    
     return processed_text, detected_mime_type, metadata, used_smart_ocr
 
 async def convert_documents_to_plaintext(original_source_dir: str, converted_source_dir: str):
     logging.info("Starting conversion of source documents to plaintext")
     os.makedirs(converted_source_dir, exist_ok=True)
     semaphore = asyncio.Semaphore(MAX_SOURCE_DOCUMENTS_TO_CONVERT_TO_PLAINTEXT_AT_ONE_TIME)
-
     async def process_file(file_name: str, pbar: tqdm):
         async with semaphore:
             source_file_path = os.path.join(original_source_dir, file_name)
@@ -1922,17 +1876,14 @@ async def convert_documents_to_plaintext(original_source_dir: str, converted_sou
                 pbar.set_postfix_str(f"Skipped {file_name} (not a file)")
                 pbar.update(1)
                 return
-
             base_name = os.path.splitext(file_name)[0]
             txt_file_path = os.path.join(converted_source_dir, f"{base_name}.txt")
             md_file_path = os.path.join(converted_source_dir, f"{base_name}.md")
-
             # Check if converted file already exists
             if os.path.exists(txt_file_path) or os.path.exists(md_file_path):
                 existing_file = txt_file_path if os.path.exists(txt_file_path) else md_file_path
                 file_size = os.path.getsize(existing_file)
-                
-                if file_size >= 2 * 1024:  # 5 KB
+                if file_size >= 1024:  # 1 KB
                     logging.info(f"Skipping {file_name} - already converted ({file_size / 1024:.2f} KB)")
                     pbar.set_postfix_str(f"Skipped {file_name} (already converted)")
                     pbar.update(1)
@@ -1940,41 +1891,31 @@ async def convert_documents_to_plaintext(original_source_dir: str, converted_sou
                 else:
                     logging.warning(f"Deleting small converted file: {existing_file} ({file_size / 1024:.2f} KB)")
                     os.remove(existing_file)
-
             try:
                 pbar.set_postfix_str(f"Processing {file_name}")
                 processed_text, mime_type, metadata, used_smart_ocr = await preprocess_document(source_file_path)
-                
                 if not processed_text.strip():
                     pbar.set_postfix_str(f"No text extracted from {file_name}")
                     pbar.update(1)
                     return
-                
                 converted_file_path = md_file_path if used_smart_ocr else txt_file_path
-                
                 with open(converted_file_path, 'w', encoding='utf-8') as f:
                     f.write(processed_text)
-                
                 file_size = os.path.getsize(converted_file_path)
                 logging.info(f"Converted {file_name} ({mime_type}) - Size: {file_size / 1024:.2f} KB")
                 pbar.set_postfix_str(f"Converted {file_name} ({mime_type})")
                 pbar.update(1)
-
             except Exception as e:
                 pbar.set_postfix_str(f"Error converting {file_name}: {str(e)}")
                 pbar.update(1)
                 logging.error(f"Error converting {file_name}: {str(e)}")
                 logging.error(traceback.format_exc())
-
     file_names = os.listdir(original_source_dir)
     logging.info(f"Found {len(file_names)} files to process in {original_source_dir}")
-
     with tqdm(total=len(file_names), desc="Converting documents", unit="file") as pbar:
         tasks = [process_file(file_name, pbar) for file_name in file_names]
         await asyncio.gather(*tasks)
-
     logging.info("Completed conversion of all documents to plaintext")
-
     # Check for and remove tiny text files
     removed_files = 0
     for file_name in os.listdir(converted_source_dir):
@@ -1983,26 +1924,46 @@ async def convert_documents_to_plaintext(original_source_dir: str, converted_sou
             logging.warning(f"Removing tiny converted file: {file_path}")
             os.remove(file_path)
             removed_files += 1
-    
     if removed_files > 0:
         logging.info(f"Removed {removed_files} tiny converted files (less than 1KB)")
     else:
         logging.info("No tiny converted files found")
-
     logging.info("Document conversion process completed")
     
-async def check_corrupted_output_file(file_path: str, original_file_path: str) -> dict:
+async def check_corrupted_output_file(file_path: str, original_file_path: str, max_retries: int = 3) -> dict:
     """
     Check if the output file is likely corrupted or unusable due to failed OCR.
+    Includes retry mechanism and validation checks.
     
     :param file_path: Path to the processed output file
     :param original_file_path: Path to the original input file
+    :param max_retries: Maximum number of retries for LLM analysis
     :return: Dictionary with corruption status and explanation
     """
+    def parse_llm_response_for_corruption_check(response: str) -> dict:
+        """Parse the LLM response into a dictionary."""
+        analysis = {}
+        for line in response.strip().split('\n'):
+            if ':' in line:
+                key, value = line.split(':', 1)
+                analysis[key.strip()] = value.strip()
+        return analysis
+    def validate_corruption_analysis_result(analysis: dict) -> bool:
+        """Validate the parsed LLM response for corruption check."""
+        required_keys = ['CORRUPTED', 'EXPLANATION', 'USABILITY_SCORE']
+        if not all(key in analysis for key in required_keys):
+            return False
+        if analysis['CORRUPTED'].lower() not in ['yes', 'no']:
+            return False
+        try:
+            usability_score = int(analysis['USABILITY_SCORE'])
+            if not 0 <= usability_score <= 100:
+                return False
+        except ValueError:
+            return False
+        return True
     with open(file_path, 'r', encoding='utf-8') as file:
         content = file.read()
-    
-    # Prepare the prompt for the LLM
     prompt = f"""Analyze the following text content from a processed document and determine if it's likely corrupted or unusable due to failed OCR. Consider these factors:
 
 1. Presence of random characters or non-readable text
@@ -2011,85 +1972,110 @@ async def check_corrupted_output_file(file_path: str, original_file_path: str) -
 4. Presence of OCR artifacts like misinterpreted characters
 
 Text content:
-{content[:1000]}  # Limiting to first 1000 characters for brevity
+{content[:3000]}  # Limiting to first 3000 characters for brevity
 
-Provide your analysis in the following format:
+Provide your analysis in the following format (without any additional text):
 CORRUPTED: [Yes/No]
 EXPLANATION: [Brief explanation of why the content is considered corrupted or not]
 USABILITY_SCORE: [0-100, where 0 is completely unusable and 100 is perfect]
 """
-
-    # Call the LLM for analysis
-    response = await generate_completion(prompt)
-    
-    # Parse the response
-    analysis = {}
-    for line in response.split('\n'):
-        if ':' in line:
-            key, value = line.split(':', 1)
-            analysis[key.strip()] = value.strip()
-    
-    is_corrupted = analysis.get('CORRUPTED', '').lower() == 'yes'
-    usability_score = int(analysis.get('USABILITY_SCORE', '0'))
-    
+    for attempt in range(max_retries):
+        try:
+            response = await generate_completion(prompt)
+            analysis = parse_llm_response_for_corruption_check(response)
+            if validate_corruption_analysis_result(analysis):
+                return {
+                    'input_file': original_file_path,
+                    'output_file': file_path,
+                    'is_corrupted': analysis['CORRUPTED'].lower() == 'yes',
+                    'explanation': analysis['EXPLANATION'],
+                    'usability_score': int(analysis['USABILITY_SCORE'])
+                }
+            else:
+                logging.warning(f"Invalid LLM response on attempt {attempt + 1}. Retrying...")
+        except Exception as e:
+            logging.error(f"Error on attempt {attempt + 1}: {str(e)}")
+        if attempt < max_retries - 1:
+            await asyncio.sleep(2 ** attempt)  # Exponential backoff
+    logging.error(f"Failed to get valid analysis after {max_retries} attempts")
     return {
         'input_file': original_file_path,
         'output_file': file_path,
-        'is_corrupted': is_corrupted,
-        'explanation': analysis.get('EXPLANATION', ''),
-        'usability_score': usability_score
+        'is_corrupted': True,
+        'explanation': 'Failed to analyze due to repeated errors',
+        'usability_score': 0
     }
 
-async def process_output_directory_to_check_for_corrupted_or_failed_files(output_dir: str, original_dir: str):
-    """
-    Process all files in the output directory and identify corrupted files.
-    
-    :param output_dir: Directory containing processed output files
-    :param original_dir: Directory containing original input files
-    """
-    corrupted_files = []
-    
-    for filename in os.listdir(output_dir):
-        if filename.endswith('.txt') or filename.endswith('.md'):
+async def process_output_directory_to_check_for_corrupted_or_failed_files(output_dir: str, original_dir: str, max_concurrent: int = 5):
+    logging.info(f"Starting to process directory: {output_dir}")
+    semaphore = asyncio.Semaphore(max_concurrent)
+    async def process_file(filename: str) -> Dict:
+        async with semaphore:
             output_file_path = os.path.join(output_dir, filename)
-            original_file_path = os.path.join(original_dir, os.path.splitext(filename)[0] + '.pdf')
-            
-            result = await check_corrupted_output_file(output_file_path, original_file_path)
-            if result['is_corrupted'] or result['usability_score'] < 50:
-                corrupted_files.append(result)
-    
-    # Save the list of corrupted files
-    with open(LIKELY_CORRUPTED_OUTPUT_FILES_JSON_PATH, 'w') as f:
-        json.dump(corrupted_files, f, indent=2)
-    
-    logging.info(f"Identified {len(corrupted_files)} potentially corrupted or unusable files. Results saved to likely_corrupted_output_files.json")
+            base_name = os.path.splitext(filename)[0]
+            # Try to find the original file with any extension
+            original_file_path = None
+            for ext in ['.pdf', '.txt', '.docx', '.doc', '.rtf', '.odt', '']:
+                potential_path = os.path.join(original_dir, base_name + ext)
+                if os.path.exists(potential_path):
+                    original_file_path = potential_path
+                    break
+            if not original_file_path:
+                logging.info(f"Original file not found for converted file: {filename}. This may be normal if not all files have been converted yet.")
+                return None
+            try:
+                result = await check_corrupted_output_file(output_file_path, original_file_path)
+                logging.info(f"Processed {filename}: Corrupted: {result['is_corrupted']}, Usability: {result['usability_score']}")
+                return result
+            except Exception as e:
+                logging.error(f"Error processing {filename}: {str(e)}")
+                return {
+                    'input_file': original_file_path,
+                    'output_file': output_file_path,
+                    'is_corrupted': True,
+                    'explanation': f"Error during processing: {str(e)}",
+                    'usability_score': 0
+                }
+    async def process_all_files() -> List[Dict]:
+        tasks = []
+        for filename in os.listdir(output_dir):
+            if filename.endswith(('.txt', '.md')):
+                tasks.append(asyncio.create_task(process_file(filename)))
+        return [result for result in await asyncio.gather(*tasks) if result is not None]
+    try:
+        all_results = await process_all_files()
+        new_corrupted_files = [result for result in all_results if result['is_corrupted'] or result['usability_score'] < 50]
+        # Read existing data
+        existing_corrupted_files = []
+        if os.path.exists(LIKELY_CORRUPTED_OUTPUT_FILES_JSON_PATH):
+            with open(LIKELY_CORRUPTED_OUTPUT_FILES_JSON_PATH, 'r') as f:
+                existing_corrupted_files = json.load(f)
+        # Combine existing and new data
+        combined_corrupted_files = existing_corrupted_files + new_corrupted_files
+        # Remove duplicates based on 'output_file' path
+        unique_corrupted_files = {file['output_file']: file for file in combined_corrupted_files}.values()
+        # Save the combined list of corrupted files
+        with open(LIKELY_CORRUPTED_OUTPUT_FILES_JSON_PATH, 'w') as f:
+            json.dump(list(unique_corrupted_files), f, indent=2)
+        logging.info(f"Identified {len(new_corrupted_files)} new potentially corrupted or unusable files out of {len(all_results)} processed.")
+        logging.info(f"Total corrupted files after update: {len(unique_corrupted_files)}")
+        logging.info(f"Results saved to {LIKELY_CORRUPTED_OUTPUT_FILES_JSON_PATH}")
+    except Exception as e:
+        logging.error(f"An error occurred while processing the output directory: {str(e)}")
+    return list(unique_corrupted_files)
 
-async def process_with_gpt4_vision(file_path: str) -> str:
-    """
-    Process a PDF file using the GPT-4 Vision API.
-    
-    :param file_path: Path to the PDF file
-    :return: Extracted text content
-    """
+async def process_difficult_pdf_with_gpt4_vision(file_path: str) -> str:
     images = convert_pdf_to_images_ocr(file_path)
     all_text = []
-
     for i, img in enumerate(images):
         logging.info(f"Processing page {i+1} of {len(images)}")
-        
-        # Preprocess the image
         preprocessed_img = preprocess_image_ocr(img)
-        
-        # Convert image to base64
         buffered = io.BytesIO()
         preprocessed_img.save(buffered, format="PNG")
         img_str = base64.b64encode(buffered.getvalue()).decode()
-
-        # Prepare the prompt
         prompt = f"""Please transcribe the text content from this image. This is page {i+1} of {len(images)} from a document.
         Maintain the original formatting as much as possible, including paragraphs, lists, and tables.
         Ignore any images or diagrams, focusing solely on the text content."""
-
         messages = [
             {"role": "system", "content": "You are a highly accurate OCR system."},
             {"role": "user", "content": [
@@ -2097,13 +2083,12 @@ async def process_with_gpt4_vision(file_path: str) -> str:
                 {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_str}"}}
             ]}
         ]
-
         try:
             response = await api_request_with_retry(
                 openai_client.chat.completions.create,
                 model="gpt-4-vision-preview",
                 messages=messages,
-                max_tokens=calculate_safe_max_tokens(1000, OPENAI_MAX_TOKENS),  # Adjust as needed
+                max_tokens=calculate_safe_max_tokens(1000, OPENAI_MAX_TOKENS),
                 temperature=0.7,
             )
             page_text = response.choices[0].message.content
@@ -2113,32 +2098,114 @@ async def process_with_gpt4_vision(file_path: str) -> str:
             logging.error(f"OpenAI API error on page {i+1}: {str(e)}")
         except Exception as e:
             logging.error(f"An unexpected error occurred while processing page {i+1}: {str(e)}")
-
     return "\n\n--- New Page ---\n\n".join(all_text)
 
+async def process_gpt4_vision_result(text: str) -> str:
+    # Similar to process_chunk_ocr, but adapted for GPT-4 Vision results
+    logging.info(f"Processing GPT-4 Vision result (length: {len(text):,} characters)")
+    async def process_text(text: str, prompt_template: str, max_chunk_size: int = 1000) -> str:
+        text = escape_special_characters(text)
+        model_name = OPENAI_COMPLETION_MODEL if API_PROVIDER == "OPENAI" else CLAUDE_MODEL_STRING
+        if estimate_tokens(text, model_name) <= max_chunk_size:
+            prompt = prompt_template.format(text=text)
+            max_tokens = min(2048, 4096 - estimate_tokens(prompt, model_name))
+            return await generate_completion(prompt, max_tokens=max_tokens)
+        parts = []
+        words = text.split()
+        current_part = []
+        current_tokens = 0
+        for word in words:
+            word_tokens = estimate_tokens(word, model_name)
+            if current_tokens + word_tokens > max_chunk_size:
+                part_text = " ".join(current_part)
+                prompt = prompt_template.format(text=part_text)
+                max_tokens = min(2048, 4096 - estimate_tokens(prompt, model_name))
+                processed_part = await generate_completion(prompt, max_tokens=max_tokens)
+                parts.append(processed_part)
+                current_part = [word]
+                current_tokens = word_tokens
+            else:
+                current_part.append(word)
+                current_tokens += word_tokens
+        if current_part:
+            part_text = " ".join(current_part)
+            prompt = prompt_template.format(text=part_text)
+            max_tokens = min(2048, 4096 - estimate_tokens(prompt, model_name))
+            processed_part = await generate_completion(prompt, max_tokens=max_tokens)
+            parts.append(processed_part)
+        return " ".join(parts)
+    # Error correction template
+    error_correction_template = """Review and correct any errors in the following text extracted from a document using GPT-4 Vision. Follow these guidelines:
+
+1. Fix any obvious transcription errors or inconsistencies
+2. Maintain original structure and formatting
+3. Preserve all original content and meaning
+4. Do not add any new information not present in the original text
+5. Ensure proper paragraph breaks and formatting
+
+IMPORTANT: Respond ONLY with the corrected text. Do not include any introduction, explanation, or metadata.
+
+Text to process:
+{text}
+
+Corrected text:
+"""
+    corrected_text = await process_text(text, error_correction_template)
+    # Markdown formatting template
+    markdown_template = """Reformat the following text as markdown, improving readability while preserving the original structure. Follow these guidelines:
+1. Convert headings to appropriate markdown heading levels (# for main titles, ## for subtitles, etc.)
+2. Ensure each heading is on its own line with a blank line before and after
+3. Maintain the original paragraph structure
+4. Format lists properly (unordered or ordered) if they exist in the original text
+5. Use emphasis (*italic*) and strong emphasis (**bold**) where appropriate
+6. Preserve all original content and meaning
+7. Do not add any extra punctuation or modify the existing punctuation
+8. Do not add any introductory text, preamble, or markdown code block indicators
+
+IMPORTANT: Start directly with the reformatted content.
+
+Text to reformat:
+
+{text}
+
+Reformatted markdown:
+"""
+    markdown_formatted = await process_text(corrected_text, markdown_template)
+    # Final filtering template
+    filtering_template = """Review the following markdown-formatted text and remove any invalid or unwanted elements without altering the actual content. Follow these guidelines:
+
+1. Remove any markdown code block indicators (```) if present
+2. Remove any preamble or introductory text
+3. Ensure the text starts directly with the content (e.g., headings, paragraphs, or lists)
+4. Do not remove any actual content, headings, or meaningful text
+5. Preserve all markdown formatting (headings, lists, emphasis, etc.)
+6. Remove any trailing whitespace or unnecessary blank lines at the end of the text
+
+IMPORTANT: Only remove invalid elements as described above. Do not alter, summarize, or remove any of the actual content.
+
+Text to filter:
+
+{text}
+
+Filtered text:
+"""
+    filtered_text = await process_text(markdown_formatted, filtering_template)
+    logging.info(f"GPT-4 Vision result processed. Output length: {len(filtered_text):,} characters")
+    return filtered_text
+
 async def process_corrupted_files_with_gpt4_vision(corrupted_files_path: str):
-    """
-    Process corrupted files using GPT-4 Vision API.
-    
-    :param corrupted_files_path: Path to the JSON file containing corrupted file information
-    """
     with open(corrupted_files_path, 'r') as f:
         corrupted_files = json.load(f)
-    
     for file_info in corrupted_files:
         input_file = file_info['input_file']
         output_file = file_info['output_file']
-        
         logging.info(f"Processing {input_file} with GPT-4 Vision API")
-        
         try:
-            extracted_text = await process_with_gpt4_vision(input_file)
-            
-            # Save the extracted text to a new file
-            new_output_file = output_file.replace('.txt', '_gpt4vision.txt').replace('.md', '_gpt4vision.md')
+            extracted_text = await process_difficult_pdf_with_gpt4_vision(input_file)
+            processed_text = await process_gpt4_vision_result(extracted_text)
+            new_output_file = output_file.replace('.txt', '_gpt4vision.md').replace('.md', '_gpt4vision.md')
             with open(new_output_file, 'w', encoding='utf-8') as f:
-                f.write(extracted_text)
-            
+                f.write(processed_text)
             logging.info(f"Successfully processed {input_file}. Result saved to {new_output_file}")
         except Exception as e:
             logging.error(f"Error processing {input_file} with GPT-4 Vision API: {str(e)}")
@@ -2146,14 +2213,10 @@ async def process_corrupted_files_with_gpt4_vision(corrupted_files_path: str):
 def create_and_populate_case_sqlite_database(config_file_path, converted_source_dir, original_source_dir):
     db_dir = 'sqlite_database_files_of_converted_documents'
     os.makedirs(db_dir, exist_ok=True)
-
     config_base_name = os.path.splitext(os.path.basename(config_file_path))[0]
     db_file_path = os.path.join(db_dir, f"{config_base_name}.sqlite")
-
     conn = sqlite3.connect(db_file_path)
     cursor = conn.cursor()
-
-    # Create enhanced case_metadata table
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS case_metadata (
         id INTEGER PRIMARY KEY,
@@ -2164,8 +2227,6 @@ def create_and_populate_case_sqlite_database(config_file_path, converted_source_
         creation_date TEXT
     )
     ''')
-
-    # Create enhanced documents table
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS documents (
         id INTEGER PRIMARY KEY,
@@ -2187,8 +2248,6 @@ def create_and_populate_case_sqlite_database(config_file_path, converted_source_
         relevance_score REAL
     )
     ''')
-
-    # Create discovery_goals table
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS discovery_goals (
         id INTEGER PRIMARY KEY,
@@ -2196,8 +2255,6 @@ def create_and_populate_case_sqlite_database(config_file_path, converted_source_
         importance INTEGER
     )
     ''')
-
-    # Create keywords table
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS keywords (
         id INTEGER PRIMARY KEY,
@@ -2206,16 +2263,12 @@ def create_and_populate_case_sqlite_database(config_file_path, converted_source_
         FOREIGN KEY (goal_id) REFERENCES discovery_goals (id)
     )
     ''')
-
-    # Create entities_of_interest table
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS entities_of_interest (
         id INTEGER PRIMARY KEY,
         entity_name TEXT UNIQUE
     )
     ''')
-
-    # Create document_entities table (for many-to-many relationship)
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS document_entities (
         document_id INTEGER,
@@ -2225,62 +2278,50 @@ def create_and_populate_case_sqlite_database(config_file_path, converted_source_
         PRIMARY KEY (document_id, entity_id)
     )
     ''')
-
-    # Insert case metadata
     with open(config_file_path, 'r') as config_file:
         config_data = json.load(config_file)
-    
     cursor.execute('''
     INSERT INTO case_metadata (config_file_path, freeform_input_text, json_config, case_name, creation_date)
     VALUES (?, ?, ?, ?, ?)
     ''', (config_file_path, USER_FREEFORM_TEXT_GOAL_INPUT, json.dumps(config_data), config_data['case_name'], datetime.now().isoformat()))
-
-    # Insert discovery goals and keywords
     for goal in config_data['discovery_goals']:
         cursor.execute('INSERT INTO discovery_goals (description, importance) VALUES (?, ?)',
-                       (goal['description'], goal['importance']))
+                        (goal['description'], goal['importance']))
         goal_id = cursor.lastrowid
         for keyword in goal['keywords']:
             cursor.execute('INSERT OR IGNORE INTO keywords (keyword, goal_id) VALUES (?, ?)',
-                           (keyword, goal_id))
-
-    # Insert entities of interest
+                            (keyword, goal_id))
     for entity in config_data['entities_of_interest']:
         cursor.execute('INSERT OR IGNORE INTO entities_of_interest (entity_name) VALUES (?)',
-                       (entity,))
-
-    # Insert documents
+                        (entity,))
     for filename in os.listdir(converted_source_dir):
         file_path = os.path.join(converted_source_dir, filename)
         original_file_path = os.path.join(original_source_dir, os.path.splitext(filename)[0] + '.pdf')
-        
         if os.path.isfile(file_path):
             with open(file_path, 'r', encoding='utf-8') as file:
                 document_text = file.read()
-            
             file_hash = hashlib.sha256(document_text.encode()).hexdigest()
-            
-            # Get file metadata
             file_stats = os.stat(file_path)
             creation_date = datetime.fromtimestamp(file_stats.st_ctime).isoformat()
             last_modified_date = datetime.fromtimestamp(file_stats.st_mtime).isoformat()
-            
-            # Determine if OCR was applied (assuming files processed with OCR end with .md)
             ocr_applied = filename.endswith('.md')
-            
-            # Check if it's an email (simplified check, can be improved)
             is_email = 'From:' in document_text[:100] and 'To:' in document_text[:200]
-            
+            email_from = email_to = email_subject = email_date = None
             if is_email:
-                # Extract email metadata (simplified, can be improved)
-                email_from = document_text.split('From:', 1)[1].split('\n', 1)[0].strip()
-                email_to = document_text.split('To:', 1)[1].split('\n', 1)[0].strip()
-                email_subject = document_text.split('Subject:', 1)[1].split('\n', 1)[0].strip()
-                email_date = document_text.split('Date:', 1)[1].split('\n', 1)[0].strip()
-            else:
-                email_from = email_to = email_subject = email_date = None
-
-            # Insert document into the database
+                email_fields = ['From:', 'To:', 'Subject:', 'Date:']
+                for field in email_fields:
+                    try:
+                        value = document_text.split(field, 1)[1].split('\n', 1)[0].strip()
+                        if field == 'From:':
+                            email_from = value
+                        elif field == 'To:':
+                            email_to = value
+                        elif field == 'Subject:':
+                            email_subject = value
+                        elif field == 'Date:':
+                            email_date = value
+                    except IndexError:
+                        logging.warning(f"Email field '{field}' not found in {filename}")
             cursor.execute('''
             INSERT OR REPLACE INTO documents (
                 original_filename, converted_filename, file_hash, document_text,
@@ -2292,10 +2333,8 @@ def create_and_populate_case_sqlite_database(config_file_path, converted_source_
                 os.path.basename(original_file_path), filename, file_hash, document_text,
                 'text/plain', file_stats.st_size, creation_date, last_modified_date,
                 is_email, email_from, email_to, email_subject, email_date,
-                ocr_applied, 0, 0  # Placeholder scores, to be updated later
+                ocr_applied, 0, 0
             ))
-            
-            # Insert document-entity relationships
             document_id = cursor.lastrowid
             for entity in config_data['entities_of_interest']:
                 if entity.lower() in document_text.lower():
@@ -2303,15 +2342,11 @@ def create_and_populate_case_sqlite_database(config_file_path, converted_source_
                     INSERT OR IGNORE INTO document_entities (document_id, entity_id)
                     SELECT ?, id FROM entities_of_interest WHERE entity_name = ?
                     ''', (document_id, entity))
-
-    # Create full-text search index
     cursor.execute('CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(document_text, content=documents, content_rowid=id)')
     cursor.execute('INSERT INTO documents_fts(documents_fts) VALUES ("rebuild")')
-
     conn.commit()
     conn.close()
-
-    print(f"Enhanced SQLite database created and populated at: {db_file_path}")
+    logging.info(f"Enhanced SQLite database created and populated at: {db_file_path}")
                 
 #############################################################################################################################    
     
@@ -2451,70 +2486,35 @@ async def main():
         await enron_collector_main()
         logging.info("Enron sample data collection completed.")
         
-    # Step 2a: Convert source documents to plaintext
-    logging.info("Now converting source documents to plaintext (and performing OCR if needed)...")
-    await convert_documents_to_plaintext(original_source_dir, converted_source_dir)
+    use_skip_conversion = 1
+    if use_skip_conversion:
+        logging.info("Skipping conversion of source documents to plaintext...")
+    else:
+        # Step 2a: Convert source documents to plaintext
+        logging.info("Now converting source documents to plaintext (and performing OCR if needed)...")
+        await convert_documents_to_plaintext(original_source_dir, converted_source_dir)
     
     # Step 2b: Check for corrupted/failed output files
     logging.info("Now checking for corrupted or failed output files...")
-    
     await process_output_directory_to_check_for_corrupted_or_failed_files(converted_source_dir, original_source_dir)
     if USE_GPT4_VISION_MODEL_FOR_FAILED_OR_CORRUPTED_FILES:
+        # Step 2b.1: Process corrupted/failed output files with GPT-4 Vision instead of pytesseract
+        logging.info("Now processing corrupted or failed output files that did not work well with pytesseract with GPT-4 Vision... (more expensive but more capable with difficult files like handwritten documents)")
         await process_corrupted_files_with_gpt4_vision(LIKELY_CORRUPTED_OUTPUT_FILES_JSON_PATH)
                     
     # New step: Create and populate a SQLite database for the discovery case containing converted documents and their metadata and other relevant information
-    logging.info("Creating and populating SQLite database...")
-    create_and_populate_case_sqlite_database(config_file_path, converted_source_dir)
+    logging.info("Creating and populating SQLite database containing converted documents and their metadata...")
+    create_and_populate_case_sqlite_database(config_file_path, converted_source_dir, original_source_dir)
                         
-    # Step 2c: Process Enron email corpus
+    # Step 2c: Process Enron email corpus, turning the archive into individual markdown files per sender if desired
     if use_enron_example:
-        logging.info("Processing Enron email corpus")
-        enron_dataset_url = "https://tile.loc.gov/storage-services/master/gdc/gdcdatasets/2018487913/2018487913.zip"                
-        enron_dataset_dir = os.path.join(project_root, 'enron_email_data')
-        os.makedirs(enron_dataset_dir, exist_ok=True)
-        zip_file_path = os.path.join(enron_dataset_dir, "enron_dataset.zip")
-
-        # Check if the zip file already exists
-        logging.info(f"Checking if Enron dataset is already downloaded at {original_source_dir}")
-        if os.path.exists(zip_file_path):
-            logging.info("Enron dataset already downloaded. Skipping download.")
-        else:
-            logging.info("Downloading Enron dataset...")
-            await download_and_extract_enron_emails_dataset(enron_dataset_url, enron_dataset_dir)
-        
-        # Extract the ZIP file directly to the enron_email_data directory
-        with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
-            zip_ref.extractall(enron_dataset_dir)
-
-        # Locate the maildir folder directly under enron_email_data
-        maildir_path = os.path.join(enron_dataset_dir, 'maildir')
-        if maildir_path:
-            # Process Enron email corpus
-            logging.info("Now processing downloaded Enron email corpus")
-            enron_emails = process_enron_maildir(maildir_path)
-            for email_data in enron_emails:
-                logging.info("Processing Enron email corpus")
-                enron_maildir_path = os.path.join(original_source_dir, 'maildir')
-                if os.path.exists(enron_maildir_path):
-                    enron_emails = process_enron_maildir(enron_maildir_path)
-                    for email_data in enron_emails:
-                        file_path = email_data['file_path']
-                        content = f"From: {email_data['headers']['From']['name']} <{email_data['headers']['From']['email']}>\n"
-                        content += f"To: {', '.join([f'{r['name']} <{r['email']}>' for r in email_data['headers']['To']])}\n"
-                        content += f"Subject: {email_data['headers']['Subject']}\n"
-                        content += f"Date: {email_data['headers']['Date']}\n\n"
-                        content += email_data['body']
-                        base_name = os.path.relpath(file_path, enron_maildir_path).replace('/', '_')
-                        converted_file_path = os.path.join(converted_source_dir, f"{base_name}.txt")
-                        os.makedirs(os.path.dirname(converted_file_path), exist_ok=True)
-                        with open(converted_file_path, 'w', encoding='utf-8') as f:
-                            f.write(content)
-                        logging.info(f"Converted Enron email: {file_path}")
-                else:
-                    logging.warning(f"Enron maildir not found at {enron_maildir_path}")            
-        else:
-            logging.error("Failed to locate Enron maildir. Skipping Enron email processing.")                
-        
+        await process_enron_email_corpus(
+            project_root,
+            original_source_dir,
+            converted_source_dir,
+            turn_enron_email_archive_into_individual_converted_markdown_files_per_sender=True  # or False
+        )          
+            
     # Load the list of previously processed files
     processed_files_path = os.path.join(project_root, 'processed_files.json')
     processed_files = load_processed_files(processed_files_path)
@@ -2526,7 +2526,7 @@ async def main():
     semaphore = asyncio.Semaphore(10)  # Adjust this value based on API rate limits
 
     # Step 3: Process converted documents
-    logging.info("Processing converted documents")
+    logging.info("\n________________________________________________________________________________\n\nNow performing automated legal discovery on converted documents!!")
     
     # Use multiprocessing to distribute document processing
     with multiprocessing.Pool(processes=multiprocessing.cpu_count()) as pool:

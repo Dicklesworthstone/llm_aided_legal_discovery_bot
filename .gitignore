@@ -171,3 +171,4 @@ folder_of_source_documents__converted_to_plaintext
 *.md
 processed_files.json
 list_of_enron_exhibit_pdf_urls.txt
+enron_email_data
