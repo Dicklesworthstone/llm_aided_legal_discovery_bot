@@ -1412,43 +1412,10 @@ async def process_chunk_multi_stage(chunk, chunk_index, total_chunks, discovery_
             "total_tokens": total_tokens,
             "chunk_text": chunk
         }
-
         return chunk_package, api_calls, total_tokens
-
     except Exception as e:
         logging.error(f"Error processing chunk {chunk_index}/{total_chunks}: {str(e)}")
         return None, api_calls, total_tokens
-    
-async def process_chunks_parallel(chunks, discovery_params):
-    tasks = [process_chunk_multi_stage(chunk, i, len(chunks), discovery_params) for i, chunk in enumerate(chunks)]
-    results = await asyncio.gather(*tasks)
-    return [result for result in results if result is not None]
-
-def chunk_transcription(transcription: List[Dict], chunk_size: int = 10, overlap: int = 5) -> List[List[Dict]]:
-    chunks = []
-    for i in range(0, len(transcription), chunk_size - overlap):
-        chunk = transcription[i:i + chunk_size]
-        chunks.append(chunk)
-    return chunks
-
-async def process_long_text(text: str, max_chunk_size: int = 2000) -> str:
-    chunks = [text[i:i+max_chunk_size] for i in range(0, len(text), max_chunk_size)]
-    processed_chunks = []
-    for i, chunk in enumerate(chunks):
-        logging.info(f"Processing long text chunk {i+1}/{len(chunks)}")
-        prompt = f"""Refine and improve the following chunk of text, ensuring consistency in formatting and content:
-
-{chunk}
-
-Refined chunk:"""
-        processed_chunk = await generate_completion(prompt, max_tokens=max_chunk_size)
-        if processed_chunk:
-            processed_chunks.append(processed_chunk)
-        else:
-            logging.error(f"Failed to process chunk {i+1}/{len(chunks)}")
-            processed_chunks.append(chunk)  # Use original chunk if processing fails
-    
-    return "\n\n".join(processed_chunks)
 
 def compile_dossier_section(processed_chunks: List[Dict[str, Any]], document_id: str, file_path: str, discovery_params: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -1594,111 +1561,6 @@ def format_importance_breakdown(sub_scores: Dict[str, Dict[str, Any]], overall_i
         breakdown += f"  - Justification: {'; '.join(set(details['justifications']))}\n"
     breakdown += f"\nThe overall importance score of {overall_importance:.2f} is a weighted average of these sub-scores."
     return breakdown
-
-def chunk_document(document_text: str, model_name: str, max_chunk_tokens: int = 2000, overlap: int = 200) -> List[str]:
-    tokenizer = get_tokenizer(model_name)
-    chunks = []
-    sentences = re.split(r'(?<=[.!?])\s+', document_text)
-    current_chunk = []
-    current_chunk_tokens = 0
-    for sentence in sentences:
-        sentence_tokens = len(tokenizer.encode(sentence))
-        if current_chunk_tokens + sentence_tokens > max_chunk_tokens:
-            if current_chunk:
-                chunks.append(' '.join(current_chunk))
-                # Create overlap
-                overlap_tokens = 0
-                while overlap_tokens < overlap and current_chunk:
-                    overlap_tokens += len(tokenizer.encode(current_chunk[-1]))
-                    current_chunk = current_chunk[-1:]
-                current_chunk_tokens = overlap_tokens
-            else:
-                # If a single sentence exceeds max_chunk_tokens, we need to split it
-                chunks.append(sentence[:max_chunk_tokens])
-                current_chunk = []
-                current_chunk_tokens = 0
-                continue
-        current_chunk.append(sentence)
-        current_chunk_tokens += sentence_tokens
-    if current_chunk:
-        chunks.append(' '.join(current_chunk))
-    return chunks
-
-async def process_document_for_discovery(file_path: str, discovery_params: Dict[str, Any], semaphore: asyncio.Semaphore, temp_folder: str) -> Dict[str, Any]:
-    logging.info(f"Processing file: {file_path}")
-    start_time = time.time()
-    total_api_calls = 0
-    total_tokens_used = 0
-    with open(file_path, 'rb') as file:
-        file_content = file.read()
-        result = magika.identify_bytes(file_content)
-        detected_mime_type = result.output.mime_type
-    document_id = hashlib.sha256(file_content).hexdigest()
-    result_file_path = os.path.join(temp_folder, f"{document_id}_results.json")
-    result = {
-        'document_id': document_id,
-        'file_path': file_path,
-        'processed_chunks': [],
-        'low_importance_chunks': [],
-        'metadata': {
-            'file_path': file_path,
-            'mime_type': detected_mime_type,
-            'file_size_bytes': os.path.getsize(file_path)
-        }
-    }
-    with open(result_file_path, 'w') as f:
-        json.dump(result, f, indent=2)
-    try:
-        processed_text, _, metadata, _ = await preprocess_document(file_path)
-        sentences = sophisticated_sentence_splitter(processed_text)
-        result['metadata']['total_sentences'] = len(sentences)
-        result['metadata']['thousands_of_input_words'] = round(sum(len(s.split()) for s in sentences) / 1000, 2)
-        if metadata:
-            result['metadata'].update(metadata)
-        with open(result_file_path, 'w') as f:
-            json.dump(result, f, indent=2)
-    except ValueError as e:
-        logging.error(f"Error parsing document {file_path}: {str(e)}")
-        return None
-    chunk_size = 10
-    chunks = [sentences[i:i + chunk_size] for i in range(0, len(sentences), chunk_size)]
-    async def process_chunk(chunk, i):
-        async with semaphore:
-            chunk_text = " ".join(chunk)
-            chunk_result, api_calls, tokens_used = await process_chunk_multi_stage(chunk_text, i, len(chunks), discovery_params)
-            if chunk_result:
-                importance_score = float(chunk_result['importance_score']['final_score'])
-                if importance_score >= discovery_params['minimum_importance_score']:
-                    result['processed_chunks'].append(chunk_result)
-                else:
-                    result['low_importance_chunks'].append(chunk_result)
-                
-                logging.info(f"Processed chunk {i+1}/{len(chunks)} for document {file_path}; importance score: {importance_score:.2f}; total chunks processed: {len(result['processed_chunks'])}; First 100 characters of generated text: {chunk_result['dossier_section'][:100]}")
-                with open(result_file_path, 'w') as f:
-                    json.dump(result, f, indent=2)
-            return chunk_result, api_calls, tokens_used
-    with ThreadPoolExecutor() as executor:
-        loop = asyncio.get_event_loop()
-        chunk_results = await asyncio.gather(*[loop.run_in_executor(executor, lambda: asyncio.run(process_chunk(chunk, i))) for i, chunk in enumerate(chunks)])
-    for chunk_result, api_calls, tokens_used in chunk_results:
-        if chunk_result:
-            total_api_calls += api_calls
-            total_tokens_used += tokens_used
-    if not result['processed_chunks'] and not result['low_importance_chunks']:
-        logging.info(f"Document {file_path} did not yield any relevant information.")
-        return None
-    dossier_section = compile_dossier_section(result['processed_chunks'], document_id, file_path, discovery_params)
-    low_importance_section = compile_dossier_section(result['low_importance_chunks'], document_id, file_path, discovery_params)
-    result['dossier_section'] = dossier_section['dossier_section'] if dossier_section else None
-    result['importance_score'] = dossier_section['importance_score'] if dossier_section else 0
-    result['low_importance_section'] = low_importance_section['dossier_section'] if low_importance_section else None
-    end_time = time.time()
-    result['processing_time_seconds'] = end_time - start_time
-    result['total_api_calls'] = total_api_calls
-    result['total_tokens_used'] = total_tokens_used
-    with open(result_file_path, 'w') as f:
-        json.dump(result, f, indent=2)
-    return result
 
 async def generate_discovery_config(user_input: str) -> str:
     async def call_llm(prompt: str) -> str:
@@ -2268,17 +2130,20 @@ USABILITY_SCORE: [0-100, where 0 is completely unusable and 100 is perfect]
         'usability_score': 50  # Neutral score if analysis fails
     }
     
-
-async def process_output_directory_to_check_for_corrupted_or_failed_files(output_dir: str, original_dir: str, max_concurrent: int = 5):
+async def process_output_directory_to_check_for_corrupted_or_failed_files(output_dir: str, original_dir: str):
     logging.info(f"Starting to process directory: {output_dir}")
-    semaphore = asyncio.Semaphore(max_concurrent)
-    async def process_file(filename: str) -> Dict:
+    semaphore = asyncio.Semaphore(25)
+    processed_files = set()
+    non_corrupt_files = set()
+    async def process_file(filename: str, minimum_usability_score: int) -> Dict:
         async with semaphore:
             if filename.startswith('email_bundle__'):
-                return None  # Skip email_bundle files
+                return None
             output_file_path = os.path.join(output_dir, filename)
-            base_name = os.path.splitext(filename)[0].lower()  # Normalize to lowercase
-            # Find the original file by matching base_name
+            base_name = os.path.splitext(filename)[0].lower()
+            if output_file_path in processed_files or output_file_path in non_corrupt_files:
+                logging.info(f"Skipping already processed file: {filename}")
+                return None
             original_file_path = next((os.path.join(original_dir, f) for f in os.listdir(original_dir) if os.path.splitext(f)[0].lower() == base_name), None)
             if not original_file_path:
                 logging.info(f"Original file not found for converted file: {filename}. This may be normal if not all files have been converted yet, or if there is not a 1:1 mapping between original and converted files (as in the case of email archives).")
@@ -2286,6 +2151,8 @@ async def process_output_directory_to_check_for_corrupted_or_failed_files(output
             try:
                 result = await check_corrupted_output_file(output_file_path, original_file_path)
                 logging.info(f"Processed {filename}: Corrupted: {result['is_corrupted']}, Usability: {result['usability_score']}")
+                if not result['is_corrupted'] and result['usability_score'] >= minimum_usability_score:
+                    non_corrupt_files.add(output_file_path)
                 return result
             except Exception as e:
                 logging.error(f"Error processing {filename}: {str(e)}")
@@ -2298,35 +2165,36 @@ async def process_output_directory_to_check_for_corrupted_or_failed_files(output
                 }
     async def process_all_files() -> List[Dict]:
         tasks = [
-            asyncio.create_task(process_file(filename))
+            asyncio.create_task(process_file(filename, MINIMUM_OCR_USABILITY_SCORE))
             for filename in os.listdir(output_dir)
-            if filename.lower().endswith(('.txt', '.md'))  # Case-insensitive matching
+            if filename.lower().endswith(('.txt', '.md'))
         ]
         return [result for result in await asyncio.gather(*tasks) if result is not None]
     try:
-        all_results = await process_all_files()
-        # Read existing data
         existing_corrupted_files = {}
         if os.path.exists(LIKELY_CORRUPTED_OUTPUT_FILES_JSON_PATH):
             with open(LIKELY_CORRUPTED_OUTPUT_FILES_JSON_PATH, 'r') as f:
                 existing_corrupted_files = {file['output_file']: file for file in json.load(f)}
-        # Update existing entries and add new ones
+                processed_files.update(existing_corrupted_files.keys())
+        if os.path.exists(LIST_OF_NON_CORRUPTED_FILES_PATH):
+            with open(LIST_OF_NON_CORRUPTED_FILES_PATH, 'r') as f:
+                non_corrupt_files.update(json.load(f))
+        all_results = await process_all_files()
         updated_corrupted_files = {}
-        minimum_usability_score_to_flag_as_corrupted = 20
         for result in all_results:
-            if result['is_corrupted'] or result['usability_score'] < minimum_usability_score_to_flag_as_corrupted:
+            processed_files.add(result['output_file'])
+            if result['is_corrupted'] or result['usability_score'] < MINIMUM_OCR_USABILITY_SCORE:
                 updated_corrupted_files[result['output_file']] = result
             elif result['output_file'] in existing_corrupted_files:
                 logging.info(f"File {result['output_file']} is no longer considered corrupted. Removing from list.")
-        # Add any existing corrupted files that weren't processed this time
         for file_path, file_data in existing_corrupted_files.items():
             if file_path not in updated_corrupted_files and os.path.exists(file_path):
                 updated_corrupted_files[file_path] = file_data
-        # Convert to list for JSON serialization
         final_corrupted_files = list(updated_corrupted_files.values())
-        # Save the updated list of corrupted files
         with open(LIKELY_CORRUPTED_OUTPUT_FILES_JSON_PATH, 'w') as f:
             json.dump(final_corrupted_files, f, indent=2)
+        with open(LIST_OF_NON_CORRUPTED_FILES_PATH, 'w') as f:
+            json.dump(list(non_corrupt_files), f, indent=2)
         new_corrupted_count = sum(1 for file in final_corrupted_files if file['output_file'] not in existing_corrupted_files)
         removed_count = sum(1 for file in existing_corrupted_files if file not in updated_corrupted_files)
         logging.info(f"Identified {new_corrupted_count} new potentially corrupted or unusable files out of {len(all_results)} processed.")
@@ -2721,17 +2589,6 @@ async def determine_files_to_process(
     logging.info(f"Files to discover: {len(files_to_discover)}")
     return list(files_to_convert), list(files_to_discover)
 
-def save_processing_info(
-    discovery_output_dir: str,
-    converted_file_name: str,
-    processing_info: Dict
-):
-    processed_files_dir = os.path.join(discovery_output_dir, 'processed_files')
-    base_name = os.path.splitext(converted_file_name)[0]
-    processed_file_path = os.path.join(processed_files_dir, f"{base_name}.json")
-    with open(processed_file_path, 'w') as f:
-        json.dump(processing_info, f, indent=2)
-
 async def process_document_async(file_path: str, converted_source_dir: str, discovery_params: Dict[str, Any], discovery_output_dir: str, semaphore: asyncio.Semaphore, model_name: str, max_chunk_tokens: int):
     logging.info(f"Processing file: {file_path}")
     start_time = time.time()
@@ -2886,7 +2743,9 @@ MAX_SOURCE_DOCUMENTS_TO_CONVERT_TO_PLAINTEXT_AT_ONE_TIME = 5
 USE_GPT4_VISION_MODEL_FOR_FAILED_OR_CORRUPTED_FILES = 0
 USE_OVERRIDE_DISCOVERY_CONFIG_JSON_FILE = 1  # Set to 1 to use override file
 OVERRIDE_CONFIG_FILE_PATH = "discovery_configuration_json_files/shareholders_vs_enron_corporation.json"
+MINIMUM_OCR_USABILITY_SCORE = 20 # Below this threshold, the document will be considered corrupted
 LIKELY_CORRUPTED_OUTPUT_FILES_JSON_PATH = 'likely_corrupted_output_files.json'
+LIST_OF_NON_CORRUPTED_FILES_PATH = "converted_output_files_already_checked_for_corruption_that_were_not_corrupted.json"
 USER_FREEFORM_TEXT_GOAL_INPUT = """
 We're working on a case involving patent infringement by TechCorp against our client, InnovativeTech. 
 We need to find any communications or documents that discuss TechCorp's knowledge of our client's patent 
