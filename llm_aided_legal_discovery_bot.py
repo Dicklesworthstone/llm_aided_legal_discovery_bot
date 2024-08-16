@@ -28,7 +28,6 @@ import picologging as logging
 from decouple import Config as DecoupleConfig, RepositoryEnv
 from magika import Magika
 from tqdm import tqdm
-from tqdm.asyncio import tqdm as atqdm
 import httpx
 import backoff
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -39,7 +38,6 @@ import pytesseract
 from PIL import Image
 import cv2
 import pypff
-import markdown
 from llama_cpp import Llama, LlamaGrammar
 import tiktoken
 from filelock import FileLock, Timeout

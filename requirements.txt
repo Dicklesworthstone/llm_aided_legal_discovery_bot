@@ -9,7 +9,6 @@ libpff-python
 llama-cpp-python
 lxml
 magika
-markdown
 numpy
 nvgpu
 openai
