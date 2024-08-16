@@ -3,6 +3,7 @@ import glob
 import traceback
 import asyncio
 import aiofiles
+import time
 import multiprocessing
 from functools import partial
 from aiolimiter import AsyncLimiter
@@ -20,7 +21,7 @@ from email.parser import BytesParser
 from email.policy import default
 from collections import Counter, defaultdict
 import urllib.request
-from typing import List, Dict, Tuple, Optional, Any
+from typing import List, Dict, Tuple, Optional, Set, Any
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
@@ -275,13 +276,20 @@ async def process_extracted_enron_emails(maildir_path: str, converted_source_dir
     logging.info(f"Now processing extracted Enron email corpus from {maildir_path}")
     semaphore = asyncio.Semaphore(25000)
     async def process_subfolder(sender: str, subfolder: str, subfolder_path: str, pbar: tqdm):
+        safe_sender = ''.join(c.lower() if c.isalnum() else '_' for c in sender)
+        safe_subfolder = ''.join(c.lower() if c.isalnum() else '_' for c in subfolder)
+        output_file_name = f"email_bundle__sender__{safe_sender}__category__{safe_subfolder}.md"
+        output_file_path = os.path.join(converted_source_dir, output_file_name)
+        if os.path.exists(output_file_path):
+            logging.info(f"Skipping already processed bundle: {output_file_name}")
+            pbar.update(sum(1 for _ in os.listdir(subfolder_path) if os.path.isfile(os.path.join(subfolder_path, _))))
+            return
         emails = []
         async def process_file(file_path: str):
             async with semaphore:
                 try:
                     email_data = await parse_enron_email_async(file_path)
                     email_data['file_path'] = file_path
-                    # Create unique per-email identifier
                     headers_str = json.dumps(email_data['headers'], sort_keys=True)
                     content_for_hash = headers_str + email_data['body']
                     email_unique_identifier = hashlib.sha256(content_for_hash.encode()).hexdigest()[:16]
@@ -299,9 +307,7 @@ async def process_extracted_enron_emails(maildir_path: str, converted_source_dir
             if os.path.isfile(file_path):
                 tasks.append(asyncio.create_task(process_file(file_path)))
         await asyncio.gather(*tasks)
-        return emails
-    async def write_bundle_file(sender: str, subfolder: str, emails: List[Dict[str, Any]]):
-        async with semaphore:
+        if emails:
             markdown_content = ""
             for index, email_data in enumerate(emails, 1):
                 markdown_content += f"# Email {index} of {len(emails)} from {sender} in {subfolder}\n\n"
@@ -319,14 +325,10 @@ async def process_extracted_enron_emails(maildir_path: str, converted_source_dir
                 markdown_content += f"**X-FileName:** {email_data['headers']['X-FileName']}\n\n"
                 markdown_content += f"**Body:**\n\n{email_data['body']}\n\n"
                 markdown_content += "---\n\n"
-            safe_sender = ''.join(c.lower() if c.isalnum() else '_' for c in sender)
-            safe_subfolder = ''.join(c.lower() if c.isalnum() else '_' for c in subfolder)
-            markdown_file_name = f"email_bundle__sender__{safe_sender}__category__{safe_subfolder}.md"
-            markdown_file_path = os.path.join(converted_source_dir, markdown_file_name)
             os.makedirs(converted_source_dir, exist_ok=True)
-            async with aiofiles.open(markdown_file_path, 'w', encoding='utf-8') as f:
+            async with aiofiles.open(output_file_path, 'w', encoding='utf-8') as f:
                 await f.write(markdown_content)
-            logging.info(f"Created markdown file: {markdown_file_name}")
+            logging.info(f"Created markdown file: {output_file_name}")
     # Get total number of files
     total_files = sum([len(files) for _, _, files in os.walk(maildir_path)])
     with tqdm(total=total_files, desc="Processing Enron emails", unit="email") as pbar:
@@ -336,19 +338,9 @@ async def process_extracted_enron_emails(maildir_path: str, converted_source_dir
                 for subfolder in os.listdir(sender_path):
                     subfolder_path = os.path.join(sender_path, subfolder)
                     if os.path.isdir(subfolder_path):
-                        # Check if this bundle has already been processed
-                        safe_sender = ''.join(c.lower() if c.isalnum() else '_' for c in sender)
-                        safe_subfolder = ''.join(c.lower() if c.isalnum() else '_' for c in subfolder)
-                        output_file_name = f"email_bundle__sender__{safe_sender}__category__{safe_subfolder}.md"
-                        output_file_path = os.path.join(converted_source_dir, output_file_name)
-                        if os.path.exists(output_file_path):
-                            logging.info(f"Skipping already processed bundle: {output_file_name}")
-                            pbar.update(sum(1 for _ in os.listdir(subfolder_path) if os.path.isfile(os.path.join(subfolder_path, _))))
-                            continue
-                        emails = await process_subfolder(sender, subfolder, subfolder_path, pbar)
-                        await write_bundle_file(sender, subfolder, emails)
+                        await process_subfolder(sender, subfolder, subfolder_path, pbar)
     logging.info("Finished processing Enron email corpus.")
-
+    
 async def process_enron_email_corpus(
     project_root: str,
     original_source_dir: str,
@@ -1341,48 +1333,53 @@ def calculate_importance_score(importance_analysis: str) -> dict:
     return breakdown
 
 async def process_chunk_multi_stage(chunk, chunk_index, total_chunks, discovery_params):
+    api_calls = 0
+    total_tokens = 0
+    async def call_api(prompt, max_tokens):
+        nonlocal api_calls, total_tokens
+        api_calls += 1
+        response = await generate_completion(prompt, max_tokens)
+        total_tokens += estimate_tokens(prompt, OPENAI_COMPLETION_MODEL) + estimate_tokens(response, OPENAI_COMPLETION_MODEL)
+        return response
     try:
         # Stage 1: Document Identification
-        doc_info = await generate_completion(doc_id_prompt.format(document_excerpt=chunk, entities_of_interest=discovery_params['entities_of_interest']))
+        doc_info = await call_api(doc_id_prompt.format(document_excerpt=chunk, entities_of_interest=discovery_params['entities_of_interest']), 500)
         # Stage 2: Relevance Check
-        relevance_analysis = await generate_completion(relevance_check_prompt.format(
+        relevance_analysis = await call_api(relevance_check_prompt.format(
             discovery_goals=discovery_params['discovery_goals'],
             doc_info=doc_info,
             document_excerpt=chunk,
             keywords=discovery_params['keywords'],
             entities_of_interest=discovery_params['entities_of_interest']
-        ))
-        # If not relevant, stop processing this chunk
+        ), 500)
         if 'RELEVANT: No' in relevance_analysis:
-            return None
+            return None, api_calls, total_tokens
         # Parallel processing stages
-        extract_task = asyncio.create_task(generate_completion(extract_gen_prompt.format(
+        extract_task = asyncio.create_task(call_api(extract_gen_prompt.format(
             relevance_analysis=relevance_analysis,
             full_document_text=chunk,
             discovery_goals=discovery_params['discovery_goals'],
             keywords=discovery_params['keywords'],
             entities_of_interest=discovery_params['entities_of_interest']
-        )))
-        tag_task = asyncio.create_task(generate_completion(tag_gen_prompt.format(
+        ), 1000))
+        tag_task = asyncio.create_task(call_api(tag_gen_prompt.format(
             doc_info=doc_info,
             relevance_analysis=relevance_analysis,
             discovery_goals=discovery_params['discovery_goals'],
             keywords=discovery_params['keywords'],
             entities_of_interest=discovery_params['entities_of_interest']
-        )))
-        # Wait for parallel tasks to complete
+        ), 500))
         key_extracts, tags = await asyncio.gather(extract_task, tag_task)
-        # Sequential stages that depend on previous results
-        explanation = await generate_completion(explanation_gen_prompt.format(
+        # Sequential stages
+        explanation = await call_api(explanation_gen_prompt.format(
             discovery_goals=discovery_params['discovery_goals'],
             doc_info=doc_info,
             key_extracts=key_extracts,
             relevance_analysis=relevance_analysis,
             keywords=discovery_params['keywords'],
             entities_of_interest=discovery_params['entities_of_interest']
-        ))
-        # Importance Score Generation
-        importance_analysis = await generate_completion(importance_score_prompt.format(
+        ), 1000)
+        importance_analysis = await call_api(importance_score_prompt.format(
             doc_info=doc_info,
             relevance_analysis=relevance_analysis,
             key_extracts=key_extracts,
@@ -1391,10 +1388,9 @@ async def process_chunk_multi_stage(chunk, chunk_index, total_chunks, discovery_
             discovery_goals=discovery_params['discovery_goals'],
             keywords_found=discovery_params['keywords'],
             entities_mentioned=discovery_params['entities_of_interest']
-        ))
+        ), 1000)
         importance_score = calculate_importance_score(importance_analysis)
-        # Final stage: Dossier Section Compilation
-        dossier_section = await generate_completion(dossier_section_prompt.format(
+        dossier_section = await call_api(dossier_section_prompt.format(
             doc_info=doc_info,
             relevance_analysis=relevance_analysis,
             key_extracts=key_extracts,
@@ -1404,7 +1400,7 @@ async def process_chunk_multi_stage(chunk, chunk_index, total_chunks, discovery_
             discovery_goals=discovery_params['discovery_goals'],
             keywords_found=discovery_params['keywords'],
             entities_mentioned=discovery_params['entities_of_interest']
-        ))
+        ), 2000)
         return {
             "doc_info": doc_info,
             "relevance": relevance_analysis,
@@ -1413,11 +1409,11 @@ async def process_chunk_multi_stage(chunk, chunk_index, total_chunks, discovery_
             "explanation": explanation,
             "importance_score": importance_score,
             "dossier_section": dossier_section
-        }
+        }, api_calls, total_tokens
     except Exception as e:
         logging.error(f"Error processing chunk {chunk_index}/{total_chunks}: {str(e)}")
-        return None
-
+        return None, api_calls, total_tokens
+    
 async def process_chunks_parallel(chunks, discovery_params):
     tasks = [process_chunk_multi_stage(chunk, i, len(chunks), discovery_params) for i, chunk in enumerate(chunks)]
     results = await asyncio.gather(*tasks)
@@ -1615,16 +1611,39 @@ def chunk_document(document_text: str, chunk_size: int = 2000, overlap: int = 20
         start = max(start + chunk_size - overlap, end - overlap)
     return chunks
 
-async def process_document_for_discovery(file_path: str, discovery_params: Dict[str, Any], semaphore: asyncio.Semaphore) -> Dict[str, Any]:
+async def process_document_for_discovery(file_path: str, discovery_params: Dict[str, Any], semaphore: asyncio.Semaphore, temp_folder: str) -> Dict[str, Any]:
     logging.info(f"Processing file: {file_path}")
+    start_time = time.time()
+    total_api_calls = 0
+    total_tokens_used = 0
     with open(file_path, 'rb') as file:
         file_content = file.read()
         result = magika.identify_bytes(file_content)
         detected_mime_type = result.output.mime_type
     document_id = hashlib.sha256(file_content).hexdigest()
+    result_file_path = os.path.join(temp_folder, f"{document_id}_results.json")
+    result = {
+        'document_id': document_id,
+        'file_path': file_path,
+        'processed_chunks': [],
+        'low_importance_chunks': [],
+        'metadata': {
+            'file_path': file_path,
+            'mime_type': detected_mime_type,
+            'file_size_bytes': os.path.getsize(file_path)
+        }
+    }
+    with open(result_file_path, 'w') as f:
+        json.dump(result, f, indent=2)
     try:
         processed_text, _, metadata, _ = await preprocess_document(file_path)
         sentences = sophisticated_sentence_splitter(processed_text)
+        result['metadata']['total_sentences'] = len(sentences)
+        result['metadata']['thousands_of_input_words'] = round(sum(len(s.split()) for s in sentences) / 1000, 2)
+        if metadata:
+            result['metadata'].update(metadata)
+        with open(result_file_path, 'w') as f:
+            json.dump(result, f, indent=2)
     except ValueError as e:
         logging.error(f"Error parsing document {file_path}: {str(e)}")
         return None
@@ -1633,42 +1652,39 @@ async def process_document_for_discovery(file_path: str, discovery_params: Dict[
     async def process_chunk(chunk, i):
         async with semaphore:
             chunk_text = " ".join(chunk)
-            return await process_chunk_multi_stage(chunk_text, i, len(chunks), discovery_params)
+            chunk_result, api_calls, tokens_used = await process_chunk_multi_stage(chunk_text, i, len(chunks), discovery_params)
+            if chunk_result:
+                importance_score = float(chunk_result['importance_score']['final_score'])
+                if importance_score >= discovery_params['minimum_importance_score']:
+                    result['processed_chunks'].append(chunk_result)
+                else:
+                    result['low_importance_chunks'].append(chunk_result)
+                
+                logging.info(f"Processed chunk {i+1}/{len(chunks)} for document {file_path}; importance score: {importance_score:.2f}; total chunks processed: {len(result['processed_chunks'])}; First 100 characters of generated text: {chunk_result['dossier_section'][:100]}")
+                with open(result_file_path, 'w') as f:
+                    json.dump(result, f, indent=2)
+            return chunk_result, api_calls, tokens_used
     with ThreadPoolExecutor() as executor:
         loop = asyncio.get_event_loop()
         chunk_results = await asyncio.gather(*[loop.run_in_executor(executor, lambda: asyncio.run(process_chunk(chunk, i))) for i, chunk in enumerate(chunks)])
-    processed_chunks = []
-    low_importance_chunks = []
-    for chunk_result in chunk_results:
+    for chunk_result, api_calls, tokens_used in chunk_results:
         if chunk_result:
-            importance_score = float(chunk_result['importance_score']['final_score'])
-            if importance_score >= discovery_params['minimum_importance_score']:
-                processed_chunks.append(chunk_result)
-            else:
-                low_importance_chunks.append(chunk_result)
-    if not processed_chunks and not low_importance_chunks:
+            total_api_calls += api_calls
+            total_tokens_used += tokens_used
+    if not result['processed_chunks'] and not result['low_importance_chunks']:
         logging.info(f"Document {file_path} did not yield any relevant information.")
         return None
-    dossier_section = compile_dossier_section(processed_chunks, document_id, file_path, discovery_params)
-    low_importance_section = compile_dossier_section(low_importance_chunks, document_id, file_path, discovery_params)
-    thousands_of_input_words = round(sum(len(s.split()) for s in sentences) / 1000, 2)
-    result = {
-        'document_id': document_id,
-        'file_path': file_path,
-        'dossier_section': dossier_section['dossier_section'] if dossier_section else None,
-        'importance_score': dossier_section['importance_score'] if dossier_section else 0,
-        'low_importance_section': low_importance_section['dossier_section'] if low_importance_section else None,
-        'metadata': {
-            'file_path': file_path,
-            'mime_type': detected_mime_type,
-            'total_sentences': len(sentences),
-            'thousands_of_input_words': thousands_of_input_words,
-            'file_size_bytes': os.path.getsize(file_path)
-        }
-    }
-    # Add email metadata if the file is an email
-    if metadata:
-        result['metadata'].update(metadata)
+    dossier_section = compile_dossier_section(result['processed_chunks'], document_id, file_path, discovery_params)
+    low_importance_section = compile_dossier_section(result['low_importance_chunks'], document_id, file_path, discovery_params)
+    result['dossier_section'] = dossier_section['dossier_section'] if dossier_section else None
+    result['importance_score'] = dossier_section['importance_score'] if dossier_section else 0
+    result['low_importance_section'] = low_importance_section['dossier_section'] if low_importance_section else None
+    end_time = time.time()
+    result['processing_time_seconds'] = end_time - start_time
+    result['total_api_calls'] = total_api_calls
+    result['total_tokens_used'] = total_tokens_used
+    with open(result_file_path, 'w') as f:
+        json.dump(result, f, indent=2)
     return result
 
 async def generate_discovery_config(user_input: str) -> str:
@@ -1795,55 +1811,7 @@ def compile_final_dossier(dossier_sections: List[Dict[str, Any]]) -> str:
         final_dossier += section['dossier_section']
         final_dossier += "\n---\n\n"
     return final_dossier
-    
-def process_document_wrapper(file_path: str, discovery_params: Dict[str, Any], converted_source_dir: str, semaphore: asyncio.Semaphore):
-    async def _process():
-        try:
-            result = await process_document_for_discovery(file_path, discovery_params, semaphore)
-            if result:
-                if result['dossier_section']:
-                    return ('high', result['dossier_section'])
-                if result['low_importance_section']:
-                    return ('low', result['low_importance_section'])
-            logging.info(f"Processed {os.path.basename(file_path)}")
-        except Exception as e:
-            logging.error(f"Error processing {os.path.basename(file_path)}: {str(e)}")
-        return None
-    return asyncio.run(_process())
-
-def get_file_hash(file_path: str) -> str:
-    with open(file_path, "rb") as f:
-        file_hash = hashlib.md5()
-        chunk = f.read(8192)
-        while chunk:
-            file_hash.update(chunk)
-            chunk = f.read(8192)
-    return file_hash.hexdigest()
-
-def manage_processed_files(directory: str, processed_files: Dict[str, str]) -> List[str]:
-    files_to_process = []
-    current_files = {}
-    for root, _, files in os.walk(directory):
-        for file in files:
-            file_path = os.path.join(root, file)
-            file_hash = get_file_hash(file_path)
-            current_files[file_path] = file_hash
-            if file_path not in processed_files or processed_files[file_path] != file_hash:
-                files_to_process.append(file_path)
-    # Remove files that no longer exist
-    processed_files = {k: v for k, v in processed_files.items() if k in current_files}
-    return files_to_process
-
-def save_processed_files(processed_files: Dict[str, str], save_path: str):
-    with open(save_path, 'w') as f:
-        json.dump(processed_files, f)
-
-def load_processed_files(save_path: str) -> Dict[str, str]:
-    if os.path.exists(save_path):
-        with open(save_path, 'r') as f:
-            return json.load(f)
-    return {}
-
+        
 async def process_pst_file(file_path: str, converted_source_dir: str) -> int:
     MAX_EMAILS_PER_BUNDLE = 1000  # Maximum number of emails per bundle
     semaphore = asyncio.Semaphore(MAX_EMAILS_PER_BUNDLE)  # Limit concurrency to avoid overloading the system
@@ -2140,18 +2108,17 @@ async def preprocess_document(file_path: str) -> Tuple[str, str, Dict[str, Any],
         processed_text = await beautify_and_format_as_markdown(processed_text)
     return processed_text, detected_mime_type, metadata, used_smart_ocr
 
-async def convert_documents_to_plaintext(original_source_dir: str, converted_source_dir: str):
+async def convert_documents_to_plaintext(original_source_dir: str, converted_source_dir: str, files_to_convert: List[str]):
     logging.info("Starting conversion of source documents to plaintext")
     os.makedirs(converted_source_dir, exist_ok=True)
     semaphore = asyncio.Semaphore(MAX_SOURCE_DOCUMENTS_TO_CONVERT_TO_PLAINTEXT_AT_ONE_TIME)
-    async def process_file(file_name: str, pbar: tqdm):
+    async def process_file(file_path: str, pbar: tqdm):
         async with semaphore:
-            source_file_path = os.path.join(original_source_dir, file_name)
-            if not os.path.isfile(source_file_path):
-                pbar.set_postfix_str(f"Skipped {file_name} (not a file)")
+            if not os.path.isfile(file_path):
+                pbar.set_postfix_str(f"Skipped {os.path.basename(file_path)} (not a file)")
                 pbar.update(1)
                 return
-            base_name = os.path.splitext(file_name)[0]
+            base_name = os.path.splitext(os.path.basename(file_path))[0]
             txt_file_path = os.path.join(converted_source_dir, f"{base_name}.txt")
             md_file_path = os.path.join(converted_source_dir, f"{base_name}.md")
             # Check if converted file already exists
@@ -2159,36 +2126,35 @@ async def convert_documents_to_plaintext(original_source_dir: str, converted_sou
                 existing_file = txt_file_path if os.path.exists(txt_file_path) else md_file_path
                 file_size = os.path.getsize(existing_file)
                 if file_size >= 1024:  # 1 KB
-                    logging.info(f"Skipping {file_name} - already converted ({file_size / 1024:.2f} KB)")
-                    pbar.set_postfix_str(f"Skipped {file_name} (already converted)")
+                    logging.info(f"Skipping {os.path.basename(file_path)} - already converted ")
+                    pbar.set_postfix_str(f"Skipped {os.path.basename(file_path)} (already converted)")
                     pbar.update(1)
                     return
                 else:
                     logging.warning(f"Deleting small converted file: {existing_file} ({file_size / 1024:.2f} KB)")
                     os.remove(existing_file)
             try:
-                pbar.set_postfix_str(f"Processing {file_name}")
-                processed_text, mime_type, metadata, used_smart_ocr = await preprocess_document(source_file_path)
+                pbar.set_postfix_str(f"Processing {os.path.basename(file_path)}")
+                processed_text, mime_type, metadata, used_smart_ocr = await preprocess_document(file_path)
                 if not processed_text.strip():
-                    pbar.set_postfix_str(f"No text extracted from {file_name}")
+                    pbar.set_postfix_str(f"No text extracted from {os.path.basename(file_path)}")
                     pbar.update(1)
                     return
                 converted_file_path = md_file_path if used_smart_ocr else txt_file_path
                 with open(converted_file_path, 'w', encoding='utf-8') as f:
                     f.write(processed_text)
                 file_size = os.path.getsize(converted_file_path)
-                logging.info(f"Converted {file_name} ({mime_type}) - Size: {file_size / 1024:.2f} KB")
-                pbar.set_postfix_str(f"Converted {file_name} ({mime_type})")
+                logging.info(f"Converted {os.path.basename(file_path)} ({mime_type}) - Size: {file_size / 1024:.2f} KB")
+                pbar.set_postfix_str(f"Converted {os.path.basename(file_path)} ({mime_type})")
                 pbar.update(1)
             except Exception as e:
-                pbar.set_postfix_str(f"Error converting {file_name}: {str(e)}")
+                pbar.set_postfix_str(f"Error converting {os.path.basename(file_path)}: {str(e)}")
                 pbar.update(1)
-                logging.error(f"Error converting {file_name}: {str(e)}")
+                logging.error(f"Error converting {os.path.basename(file_path)}: {str(e)}")
                 logging.error(traceback.format_exc())
-    file_names = os.listdir(original_source_dir)
-    logging.info(f"Found {len(file_names)} files to process in {original_source_dir}")
-    with tqdm(total=len(file_names), desc="Converting documents", unit="file") as pbar:
-        tasks = [process_file(file_name, pbar) for file_name in file_names]
+    logging.info(f"Found {len(files_to_convert)} files to process")
+    with tqdm(total=len(files_to_convert), desc="Converting documents", unit="file") as pbar:
+        tasks = [process_file(file_path, pbar) for file_path in files_to_convert]
         await asyncio.gather(*tasks)
     logging.info("Completed conversion of all documents to plaintext")
     # Check for and remove tiny text files
@@ -2507,144 +2473,321 @@ async def process_corrupted_files_with_gpt4_vision(corrupted_files_path: str):
         except Exception as e:
             logging.error(f"Error processing {input_file} with GPT-4 Vision API: {str(e)}")
             
-def create_and_populate_case_sqlite_database(config_file_path, converted_source_dir, original_source_dir):
+def create_and_populate_case_sqlite_database(config_file_path, converted_source_dir, original_source_dir, discovery_output_dir):
+    logging.info("Starting database creation and population process")
     db_dir = 'sqlite_database_files_of_converted_documents'
     os.makedirs(db_dir, exist_ok=True)
     config_base_name = os.path.splitext(os.path.basename(config_file_path))[0]
     db_file_path = os.path.join(db_dir, f"{config_base_name}.sqlite")
     conn = sqlite3.connect(db_file_path)
     cursor = conn.cursor()
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS case_metadata (
-        id INTEGER PRIMARY KEY,
-        config_file_path TEXT,
-        freeform_input_text TEXT,
-        json_config TEXT,
-        case_name TEXT,
-        creation_date TEXT
-    )
-    ''')
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS documents (
-        id INTEGER PRIMARY KEY,
-        original_filename TEXT,
-        converted_filename TEXT,
-        file_hash TEXT UNIQUE,
-        document_text TEXT,
-        mime_type TEXT,
-        file_size_bytes INTEGER,
-        creation_date TEXT,
-        last_modified_date TEXT,
-        is_email BOOLEAN,
-        email_from TEXT,
-        email_to TEXT,
-        email_subject TEXT,
-        email_date TEXT,
-        ocr_applied BOOLEAN,
-        importance_score REAL,
-        relevance_score REAL
-    )
-    ''')
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS discovery_goals (
-        id INTEGER PRIMARY KEY,
-        description TEXT,
-        importance INTEGER
-    )
-    ''')
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS keywords (
-        id INTEGER PRIMARY KEY,
-        keyword TEXT UNIQUE,
-        goal_id INTEGER,
-        FOREIGN KEY (goal_id) REFERENCES discovery_goals (id)
-    )
-    ''')
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS entities_of_interest (
-        id INTEGER PRIMARY KEY,
-        entity_name TEXT UNIQUE
-    )
-    ''')
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS document_entities (
-        document_id INTEGER,
-        entity_id INTEGER,
-        FOREIGN KEY (document_id) REFERENCES documents (id),
-        FOREIGN KEY (entity_id) REFERENCES entities_of_interest (id),
-        PRIMARY KEY (document_id, entity_id)
-    )
-    ''')
+    logging.info(f"Created SQLite database at: {db_file_path}")
+
+    # Create tables
+    tables = [
+        ("case_metadata", '''CREATE TABLE IF NOT EXISTS case_metadata (
+            id INTEGER PRIMARY KEY, config_file_path TEXT, freeform_input_text TEXT,
+            json_config TEXT, case_name TEXT, creation_date TEXT)'''),
+        ("documents", '''CREATE TABLE IF NOT EXISTS documents (
+            id INTEGER PRIMARY KEY, original_filename TEXT, converted_filename TEXT,
+            file_hash TEXT UNIQUE, document_text TEXT, mime_type TEXT,
+            file_size_bytes INTEGER, creation_date TEXT, last_modified_date TEXT,
+            is_email BOOLEAN, email_from TEXT, email_to TEXT, email_subject TEXT,
+            email_date TEXT, ocr_applied BOOLEAN, importance_score REAL,
+            relevance_score REAL, processing_completion_datetime TEXT,
+            processing_time_seconds REAL, llm_api_calls INTEGER,
+            total_tokens_used INTEGER, high_priority_dossier_length INTEGER,
+            low_priority_dossier_length INTEGER)'''),
+        ("document_conversions", '''CREATE TABLE IF NOT EXISTS document_conversions (
+            id INTEGER PRIMARY KEY, original_document_id INTEGER,
+            converted_document_id INTEGER, conversion_type TEXT,
+            FOREIGN KEY (original_document_id) REFERENCES documents (id),
+            FOREIGN KEY (converted_document_id) REFERENCES documents (id))'''),
+        ("discovery_goals", '''CREATE TABLE IF NOT EXISTS discovery_goals (
+            id INTEGER PRIMARY KEY, description TEXT, importance INTEGER)'''),
+        ("keywords", '''CREATE TABLE IF NOT EXISTS keywords (
+            id INTEGER PRIMARY KEY, keyword TEXT UNIQUE, goal_id INTEGER,
+            FOREIGN KEY (goal_id) REFERENCES discovery_goals (id))'''),
+        ("entities_of_interest", '''CREATE TABLE IF NOT EXISTS entities_of_interest (
+            id INTEGER PRIMARY KEY, entity_name TEXT UNIQUE)'''),
+        ("document_entities", '''CREATE TABLE IF NOT EXISTS document_entities (
+            document_id INTEGER, entity_id INTEGER,
+            FOREIGN KEY (document_id) REFERENCES documents (id),
+            FOREIGN KEY (entity_id) REFERENCES entities_of_interest (id),
+            PRIMARY KEY (document_id, entity_id))'''),
+        ("discovery_outputs", '''CREATE TABLE IF NOT EXISTS discovery_outputs (
+            id INTEGER PRIMARY KEY, document_id INTEGER, output_type TEXT,
+            output_content TEXT, FOREIGN KEY (document_id) REFERENCES documents (id))''')
+    ]
+
+    for table_name, create_table_sql in tables:
+        cursor.execute(create_table_sql)
+        logging.info(f"Created table: {table_name}")
+
+    # Insert case metadata
     with open(config_file_path, 'r') as config_file:
         config_data = json.load(config_file)
-    cursor.execute('''
-    INSERT INTO case_metadata (config_file_path, freeform_input_text, json_config, case_name, creation_date)
-    VALUES (?, ?, ?, ?, ?)
-    ''', (config_file_path, USER_FREEFORM_TEXT_GOAL_INPUT, json.dumps(config_data), config_data['case_name'], datetime.now().isoformat()))
-    for goal in config_data['discovery_goals']:
+
+    cursor.execute('''INSERT INTO case_metadata 
+        (config_file_path, freeform_input_text, json_config, case_name, creation_date)
+        VALUES (?, ?, ?, ?, ?)''', 
+        (config_file_path, USER_FREEFORM_TEXT_GOAL_INPUT, json.dumps(config_data), 
+         config_data['case_name'], datetime.now().isoformat()))
+    logging.info("Inserted case metadata")
+
+    # Insert discovery goals, keywords, and entities
+    for goal in tqdm(config_data['discovery_goals'], desc="Inserting discovery goals and keywords"):
         cursor.execute('INSERT INTO discovery_goals (description, importance) VALUES (?, ?)',
                         (goal['description'], goal['importance']))
         goal_id = cursor.lastrowid
         for keyword in goal['keywords']:
             cursor.execute('INSERT OR IGNORE INTO keywords (keyword, goal_id) VALUES (?, ?)',
                             (keyword, goal_id))
-    for entity in config_data['entities_of_interest']:
+
+    for entity in tqdm(config_data['entities_of_interest'], desc="Inserting entities of interest"):
         cursor.execute('INSERT OR IGNORE INTO entities_of_interest (entity_name) VALUES (?)',
                         (entity,))
-    for filename in os.listdir(converted_source_dir):
-        file_path = os.path.join(converted_source_dir, filename)
-        original_file_path = os.path.join(original_source_dir, os.path.splitext(filename)[0] + '.pdf')
-        if os.path.isfile(file_path):
-            with open(file_path, 'r', encoding='utf-8') as file:
-                document_text = file.read()
-            file_hash = hashlib.sha256(document_text.encode()).hexdigest()
-            file_stats = os.stat(file_path)
-            creation_date = datetime.fromtimestamp(file_stats.st_ctime).isoformat()
-            last_modified_date = datetime.fromtimestamp(file_stats.st_mtime).isoformat()
-            ocr_applied = filename.endswith('.md')
-            is_email = 'From:' in document_text[:100] and 'To:' in document_text[:200]
-            email_from = email_to = email_subject = email_date = None
-            if is_email:
-                email_fields = ['From:', 'To:', 'Subject:', 'Date:']
-                for field in email_fields:
-                    try:
-                        value = document_text.split(field, 1)[1].split('\n', 1)[0].strip()
-                        if field == 'From:':
-                            email_from = value
-                        elif field == 'To:':
-                            email_to = value
-                        elif field == 'Subject:':
-                            email_subject = value
-                        elif field == 'Date:':
-                            email_date = value
-                    except IndexError:
-                        logging.warning(f"Email field '{field}' not found in {filename}")
-            cursor.execute('''
-            INSERT OR REPLACE INTO documents (
-                original_filename, converted_filename, file_hash, document_text,
-                mime_type, file_size_bytes, creation_date, last_modified_date,
-                is_email, email_from, email_to, email_subject, email_date,
-                ocr_applied, importance_score, relevance_score
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                os.path.basename(original_file_path), filename, file_hash, document_text,
-                'text/plain', file_stats.st_size, creation_date, last_modified_date,
-                is_email, email_from, email_to, email_subject, email_date,
-                ocr_applied, 0, 0
-            ))
-            document_id = cursor.lastrowid
-            for entity in config_data['entities_of_interest']:
-                if entity.lower() in document_text.lower():
-                    cursor.execute('''
-                    INSERT OR IGNORE INTO document_entities (document_id, entity_id)
-                    SELECT ?, id FROM entities_of_interest WHERE entity_name = ?
-                    ''', (document_id, entity))
-    cursor.execute('CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(document_text, content=documents, content_rowid=id)')
-    cursor.execute('INSERT INTO documents_fts(documents_fts) VALUES ("rebuild")')
+
+    def insert_document(file_path, is_original):
+        with open(file_path, 'rb') as file:
+            file_content = file.read()
+            result = magika.identify_bytes(file_content)
+            detected_mime_type = result.output.mime_type
+        file_hash = hashlib.sha256(file_content).hexdigest()
+        is_text = detected_mime_type.startswith(('text/', 'application/json', 'application/xml'))
+        if is_text:
+            encodings_to_try = ['utf-8', 'latin-1', 'ascii', 'utf-16', 'utf-32']
+            document_text = None
+            for encoding in encodings_to_try:
+                try:
+                    document_text = file_content.decode(encoding)
+                    break
+                except UnicodeDecodeError:
+                    continue
+            if document_text is None:
+                is_text = False
+        if not is_text:
+            document_text = f"[Binary content, size: {len(file_content)} bytes, MIME type: {detected_mime_type}]"
+        file_stats = os.stat(file_path)
+        creation_date = datetime.fromtimestamp(file_stats.st_ctime).isoformat()
+        last_modified_date = datetime.fromtimestamp(file_stats.st_mtime).isoformat()
+        ocr_applied = file_path.endswith('.md')
+        is_email = False
+        email_from = email_to = email_subject = email_date = None
+        if is_text and document_text.startswith("From:") and "To:" in document_text[:200]:
+            is_email = True
+            email_fields = ['From:', 'To:', 'Subject:', 'Date:']
+            for field in email_fields:
+                try:
+                    value = document_text.split(field, 1)[1].split('\n', 1)[0].strip()
+                    if field == 'From:':
+                        email_from = value
+                    elif field == 'To:':
+                        email_to = value
+                    elif field == 'Subject:':
+                        email_subject = value
+                    elif field == 'Date:':
+                        email_date = value
+                except IndexError:
+                    logging.warning(f"Email field '{field}' not found in {file_path}")
+        cursor.execute('''INSERT OR REPLACE INTO documents 
+            (original_filename, converted_filename, file_hash, document_text,
+            mime_type, file_size_bytes, creation_date, last_modified_date,
+            is_email, email_from, email_to, email_subject, email_date,
+            ocr_applied, importance_score, relevance_score)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', 
+            (os.path.basename(file_path), os.path.basename(file_path) if not is_original else None,
+            file_hash, document_text, detected_mime_type, file_stats.st_size,
+            creation_date, last_modified_date, is_email, email_from, email_to,
+            email_subject, email_date, ocr_applied, 0, 0))
+        return cursor.lastrowid, file_hash
+
+    # Process original documents
+    original_docs = {}
+    original_files = [os.path.join(root, file) for root, _, files in os.walk(original_source_dir) for file in files]
+    for file_path in tqdm(original_files, desc="Processing original documents"):
+        doc_id, file_hash = insert_document(file_path, True)
+        original_docs[file_hash] = doc_id
+
+    # Process converted documents and link to original documents
+    converted_files = [os.path.join(root, file) for root, _, files in os.walk(converted_source_dir) for file in files]
+    for file_path in tqdm(converted_files, desc="Processing converted documents"):
+        doc_id, file_hash = insert_document(file_path, False)
+        original_doc_id = original_docs.get(file_hash)
+        if original_doc_id:
+            cursor.execute('''INSERT INTO document_conversions 
+                (original_document_id, converted_document_id, conversion_type)
+                VALUES (?, ?, ?)''', (original_doc_id, doc_id, 'direct'))
+        else:
+            base_name = os.path.splitext(os.path.basename(file_path))[0]
+            if 'email_bundle' in base_name:
+                cursor.execute('''INSERT INTO document_conversions 
+                    (original_document_id, converted_document_id, conversion_type)
+                    VALUES (?, ?, ?)''', (None, doc_id, 'email_bundle'))
+            elif base_name.startswith('pst_'):
+                cursor.execute('''INSERT INTO document_conversions 
+                    (original_document_id, converted_document_id, conversion_type)
+                    VALUES (?, ?, ?)''', (None, doc_id, 'pst_extraction'))
+
+    # Process discovery outputs
+    processed_files_dir = os.path.join(discovery_output_dir, 'processed_files')
+    os.makedirs(processed_files_dir, exist_ok=True)
+    processed_files = [f for f in os.listdir(processed_files_dir) if f.endswith('.json')]
+    for filename in tqdm(processed_files, desc="Processing discovery outputs"):
+        with open(os.path.join(processed_files_dir, filename), 'r') as f:
+            processing_info = json.load(f)
+        converted_filename = os.path.splitext(filename)[0]
+        cursor.execute('SELECT id FROM documents WHERE converted_filename = ?', (converted_filename,))
+        document_id = cursor.fetchone()
+        if document_id:
+            document_id = document_id[0]
+            cursor.execute('''UPDATE documents SET
+                processing_completion_datetime = ?,
+                processing_time_seconds = ?,
+                llm_api_calls = ?,
+                total_tokens_used = ?,
+                high_priority_dossier_length = ?,
+                low_priority_dossier_length = ?
+                WHERE id = ?''', 
+                (processing_info['completion_datetime'],
+                processing_info['processing_time_seconds'],
+                processing_info['llm_api_calls'],
+                processing_info['total_tokens_used'],
+                processing_info['high_priority_dossier_length'],
+                processing_info['low_priority_dossier_length'],
+                document_id))
+
+    # Process other discovery outputs
+    results_dir = os.path.join(discovery_output_dir, 'results')
+    os.makedirs(results_dir, exist_ok=True)
+    result_files = [f for f in os.listdir(results_dir) if f.endswith('_results.json')]
+    for filename in tqdm(result_files, desc="Processing discovery results"):
+        with open(os.path.join(results_dir, filename), 'r') as f:
+            result_data = json.load(f)
+        converted_filename = result_data.get('file_path')
+        if converted_filename:
+            cursor.execute('SELECT id FROM documents WHERE converted_filename = ?', (os.path.basename(converted_filename),))
+            document_id = cursor.fetchone()
+            if document_id:
+                document_id = document_id[0]
+                if 'dossier_section' in result_data:
+                    cursor.execute('''INSERT INTO discovery_outputs 
+                        (document_id, output_type, output_content)
+                        VALUES (?, ?, ?)''', 
+                        (document_id, 'high_priority_dossier', result_data['dossier_section']))
+                if 'low_importance_section' in result_data:
+                    cursor.execute('''INSERT INTO discovery_outputs 
+                        (document_id, output_type, output_content)
+                        VALUES (?, ?, ?)''', 
+                        (document_id, 'low_priority_dossier', result_data['low_importance_section']))
     conn.commit()
     conn.close()
     logging.info(f"Enhanced SQLite database created and populated at: {db_file_path}")
                 
+async def determine_files_to_process(
+    original_source_dir: str,
+    converted_source_dir: str,
+    discovery_output_dir: str
+) -> Tuple[List[str], List[str]]:
+    files_to_convert: Set[str] = set()
+    files_to_discover: Set[str] = set()
+    processed_files_dir = os.path.join(discovery_output_dir, 'processed_files')
+    os.makedirs(processed_files_dir, exist_ok=True)
+    semaphore = asyncio.Semaphore(100)  # Adjust this value based on your system's capabilities
+    async def check_file(file_path: str, is_original: bool, pbar: tqdm):
+        async with semaphore:
+            relative_path = os.path.relpath(file_path, original_source_dir if is_original else converted_source_dir)
+            base_name = os.path.splitext(relative_path)[0]
+            if is_original:
+                if file_path.lower().endswith('.pst'):
+                    pst_converted_dir = os.path.join(converted_source_dir, base_name)
+                    if not os.path.exists(pst_converted_dir) or not os.listdir(pst_converted_dir):
+                        files_to_convert.add(file_path)
+                        pbar.set_description(f"Needs conversion: {relative_path}")
+                        logging.info(f"PST file needs conversion: {relative_path}")
+                    else:
+                        pbar.set_description(f"Already converted: {relative_path}")
+                        logging.info(f"PST file already converted: {relative_path}")
+                else:
+                    converted_txt_path = os.path.join(converted_source_dir, f"{base_name}.txt")
+                    converted_md_path = os.path.join(converted_source_dir, f"{base_name}.md")
+                    if not os.path.exists(converted_txt_path) and not os.path.exists(converted_md_path):
+                        files_to_convert.add(file_path)
+                        pbar.set_description(f"Needs conversion: {relative_path}")
+                        logging.info(f"File needs conversion: {relative_path}")
+                    else:
+                        pbar.set_description(f"Already converted: {relative_path}")
+                        logging.info(f"File already converted: {relative_path}")
+            else:
+                if file_path.endswith(('.txt', '.md')):
+                    processed_file_path = os.path.join(processed_files_dir, f"{base_name}.json")
+                    if not os.path.exists(processed_file_path):
+                        files_to_discover.add(file_path)
+                        pbar.set_description(f"Needs discovery: {relative_path}")
+                        logging.info(f"File needs discovery processing: {relative_path}")
+                    else:
+                        pbar.set_description(f"Already processed: {relative_path}")
+                        logging.info(f"Skipping already processed file: {relative_path}")
+            pbar.update(1)
+    all_files = []
+    for root, _, files in os.walk(original_source_dir):
+        all_files.extend((os.path.join(root, filename), True) for filename in files)
+    for root, _, files in os.walk(converted_source_dir):
+        all_files.extend((os.path.join(root, filename), False) for filename in files)
+    logging.info(f"Total files to check: {len(all_files)}")
+    with tqdm(total=len(all_files), desc="Checking files", unit="file") as pbar:
+        tasks = [check_file(file_path, is_original, pbar) for file_path, is_original in all_files]
+        await asyncio.gather(*tasks)
+    logging.info(f"Files to convert: {len(files_to_convert)}")
+    logging.info(f"Files to discover: {len(files_to_discover)}")
+    return list(files_to_convert), list(files_to_discover)
+
+def save_processing_info(
+    discovery_output_dir: str,
+    converted_file_name: str,
+    processing_info: Dict
+):
+    processed_files_dir = os.path.join(discovery_output_dir, 'processed_files')
+    base_name = os.path.splitext(converted_file_name)[0]
+    processed_file_path = os.path.join(processed_files_dir, f"{base_name}.json")
+    with open(processed_file_path, 'w') as f:
+        json.dump(processing_info, f, indent=2)
+    
+async def process_document_wrapper(file_path: str, discovery_params: Dict[str, Any], discovery_output_dir: str, semaphore: asyncio.Semaphore):
+    try:
+        async with semaphore:
+            # Check if the file has already been processed
+            processed_file_path = os.path.join(discovery_output_dir, 'processed_files', f"{os.path.basename(file_path)}.json")
+            if os.path.exists(processed_file_path):
+                logging.info(f"Skipping already processed file: {os.path.basename(file_path)}")
+                return None
+            result = await process_document_for_discovery(file_path, discovery_params, semaphore, discovery_output_dir)
+            if result:
+                processing_info = {
+                    "completion_datetime": datetime.now().isoformat(),
+                    "processing_time_seconds": result['processing_time_seconds'],
+                    "llm_api_calls": result['total_api_calls'],
+                    "total_tokens_used": result['total_tokens_used'],
+                    "high_priority_dossier_length": len(result.get('dossier_section', '')),
+                    "low_priority_dossier_length": len(result.get('low_importance_section', '')),
+                }
+                save_processing_info(discovery_output_dir, os.path.basename(file_path), processing_info)
+                logging.info(f"Processed {os.path.basename(file_path)}")
+                return result
+    except Exception as e:
+        logging.error(f"Error processing {os.path.basename(file_path)}: {str(e)}")
+    return None
+
+def process_document_wrapper_mp(file_path, discovery_params, discovery_output_dir, semaphore):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        result = loop.run_until_complete(process_document_wrapper(file_path, discovery_params, discovery_output_dir, semaphore))
+        return result
+    finally:
+        loop.close()
+        
+                        
 #############################################################################################################################    
     
 # Static configuration
@@ -2783,6 +2926,15 @@ async def main():
         await enron_collector_main()
         logging.info("Enron sample data collection completed.")
         
+    # Create a discovery_output_dir folder for intermediate results
+    discovery_output_dir = os.path.join(project_root, f"discovery_output__{os.path.splitext(os.path.basename(config_file_path))[0]}")
+    os.makedirs(discovery_output_dir, exist_ok=True)
+    
+    # Determine which files need to be processed
+    files_to_convert, files_to_discover = await determine_files_to_process(original_source_dir, converted_source_dir, discovery_output_dir)
+    logging.info(f"Files to convert: {len(files_to_convert)}")
+    logging.info(f"Files to discover: {len(files_to_discover)}")
+
     use_skip_conversion = 1
     if use_skip_conversion:
         logging.info("Skipping conversion of source documents to plaintext...")
@@ -2830,45 +2982,49 @@ async def main():
             converted_source_dir
         )          
             
-    # Step 2d: Create and populate a SQLite database for the discovery case containing converted documents and their metadata and other relevant information
+    # Step 2d: Create and populate a SQLite database for the discovery case
     logging.info("Creating and populating SQLite database containing converted documents and their metadata...")
-    create_and_populate_case_sqlite_database(config_file_path, converted_source_dir, original_source_dir)
-                                    
-    # Load the list of previously processed files
-    processed_files_path = os.path.join(project_root, 'processed_files.json')
-    processed_files = load_processed_files(processed_files_path)
-
-    # Determine which files need to be processed
-    files_to_process = manage_processed_files(converted_source_dir, processed_files)
-
+    create_and_populate_case_sqlite_database(config_file_path, converted_source_dir, original_source_dir, discovery_output_dir)
+    
     # Create a semaphore to limit concurrent API calls
-    semaphore = asyncio.Semaphore(10)  # Adjust this value based on API rate limits
+    semaphore = asyncio.Semaphore(20)  # Adjust this value based on API rate limits
 
     # Step 3: Process converted documents
     logging.info("\n________________________________________________________________________________\n\nNow performing automated legal discovery on converted documents!!")
-    
-    # Use multiprocessing to distribute document processing
+
+    # Use multiprocessing to distribute document processing with a progress bar
+    total_files = len(files_to_discover)
     with multiprocessing.Pool(processes=multiprocessing.cpu_count()) as pool:
-        results = pool.map(partial(process_document_wrapper, 
-                                    discovery_params=discovery_params, 
-                                    converted_source_dir=converted_source_dir,
-                                    semaphore=semaphore), 
-                            files_to_process)
+        with tqdm(total=total_files, desc="Processing documents", unit="file") as pbar:
+            results = []
+            for result in pool.imap_unordered(
+                partial(process_document_wrapper_mp, 
+                        discovery_params=discovery_params, 
+                        discovery_output_dir=discovery_output_dir,
+                        semaphore=semaphore), 
+                files_to_discover
+            ):
+                if result is not None:
+                    results.append(result)
+                pbar.update()
 
-    # Update processed files and save
-    for file_path in files_to_process:
-        processed_files[file_path] = get_file_hash(file_path)
-    save_processed_files(processed_files, processed_files_path)
-
-    # Separate high and low importance sections
+    # Compile dossiers from saved JSON files
     dossier_sections = []
     low_importance_sections = []
-    for result in results:
-        if result:
-            if result[0] == 'high':
-                dossier_sections.append(result[1])
-            elif result[0] == 'low':
-                low_importance_sections.append(result[1])
+    results_dir = os.path.join(discovery_output_dir, 'results')
+    for file in os.listdir(results_dir):
+        if file.endswith('_results.json'):
+            try:
+                with open(os.path.join(results_dir, file), 'r') as f:
+                    data = json.load(f)
+                    if data.get('dossier_section'):
+                        dossier_sections.append(data['dossier_section'])
+                    if data.get('low_importance_section'):
+                        low_importance_sections.append(data['low_importance_section'])
+            except json.JSONDecodeError:
+                logging.error(f"Error decoding JSON file: {file}")
+            except Exception as e:
+                logging.error(f"Error processing file {file}: {str(e)}")
 
     # Step 4: Compile final dossier
     logging.info("Compiling final dossier")
@@ -2891,7 +3047,6 @@ async def main():
 
     logging.info(f"Legal discovery process completed. Dossier saved to {dossier_file_path}")
     logging.info(f"Low-importance dossier saved to {low_importance_file_path}")
-
 
 if __name__ == '__main__':
     asyncio.run(main())
