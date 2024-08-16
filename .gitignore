@@ -172,3 +172,4 @@ folder_of_source_documents__converted_to_plaintext
 processed_files.json
 list_of_enron_exhibit_pdf_urls.txt
 enron_email_data
+likely_corrupted_output_files.json

@@ -1,16 +1,1 @@
-[
-  {
-    "input_file": "/home/ubuntu/llm_aided_legal_discovery_bot/folder_of_source_documents__original_format/bfdemo18.pdf",
-    "output_file": "/home/ubuntu/llm_aided_legal_discovery_bot/folder_of_source_documents__converted_to_plaintext/bfdemo18.md",
-    "is_corrupted": true,
-    "explanation": "The text contains random characters (e.g., \"\u00a977gne\" and \"\u00a7\") and misinterpreted symbols that disrupt readability. There are also disconnected fragments and a lack of coherent sentences, indicating significant OCR issues.",
-    "usability_score": 30
-  },
-  {
-    "input_file": "/home/ubuntu/llm_aided_legal_discovery_bot/folder_of_source_documents__original_format/bfdemo06.pdf",
-    "output_file": "/home/ubuntu/llm_aided_legal_discovery_bot/folder_of_source_documents__converted_to_plaintext/bfdemo06.md",
-    "is_corrupted": true,
-    "explanation": "The text contains disjointed phrases and lacks coherent sentences or logical flow, indicating possible OCR errors. There are also instances of seemingly random phrases (e.g., \"Line of Credit Ken Lay\u2019s\"), which may suggest misinterpretation of the original content.",
-    "usability_score": 30
-  }
-]
+[]
