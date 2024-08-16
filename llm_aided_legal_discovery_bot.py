@@ -2028,10 +2028,13 @@ async def preprocess_document(file_path: str) -> Tuple[str, str, Dict[str, Any],
     file_extension = os.path.splitext(file_path)[1].lower()
     metadata = {}
     used_smart_ocr = False
+    already_in_markdown = False
     if file_path.lower().endswith(('.md', '.txt')) or detected_mime_type in ['text/plain', 'text/markdown']:
         logging.info(f"Reading text directly from {file_path}")
         with open(file_path, 'r', encoding='utf-8') as file:
             extracted_text = file.read()
+        if file_path.lower().endswith('.md'):
+            already_in_markdown = True
     elif detected_mime_type.startswith('application/pdf') and robust_needs_ocr(file_path):
         logging.info(f"PDF {file_path} requires OCR. Starting OCR process...")
         images = convert_pdf_to_images_ocr(file_path)
@@ -2072,7 +2075,7 @@ async def preprocess_document(file_path: str) -> Tuple[str, str, Dict[str, Any],
     sentences = sophisticated_sentence_splitter(extracted_text)
     processed_text = "\n".join(sentences)
     # Apply beautification and markdown formatting for non-OCR processed documents (since these already have markdown formatting)
-    if not used_smart_ocr:
+    if not used_smart_ocr and not already_in_markdown:
         processed_text = await beautify_and_format_as_markdown(processed_text)
     return processed_text, detected_mime_type, metadata, used_smart_ocr
 
