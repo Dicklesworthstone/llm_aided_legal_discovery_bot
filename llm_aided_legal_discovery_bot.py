@@ -1843,47 +1843,108 @@ def load_processed_files(save_path: str) -> Dict[str, str]:
             return json.load(f)
     return {}
 
-def process_pst_file(file_path: str) -> str:
-    """
-    Process Outlook PST files and bundle messages into markdown format.
-    """
+async def process_pst_file(file_path: str, converted_source_dir: str) -> int:
+    MAX_EMAILS_PER_BUNDLE = 1000  # Maximum number of emails per bundle
+    semaphore = asyncio.Semaphore(MAX_EMAILS_PER_BUNDLE)  # Limit concurrency to avoid overloading the system
     logging.info(f"Processing PST file: {file_path}")
     try:
         pst = pypff.file()
         pst.open(file_path)
         root = pst.get_root_folder()
-        messages_by_sender = defaultdict(list)
-        def process_folder(folder):
-            for message in folder.sub_messages:
+        emails_by_sender = defaultdict(list)
+        tasks = []
+        async def process_message(message):
+            async with semaphore:
                 sender = message.get_sender_name()
+                sender_email = message.get_sender_email_address()
+                if not sender_email:
+                    _, sender_email = parseaddr(sender)
                 subject = message.get_subject()
                 body = message.get_plain_text_body()
                 date = message.get_delivery_time()
-                recipient = message.get_recipients()
-                recipient = recipient[0].get_email() if recipient else "Unknown"
-                message_md = "## Email\n\n"
-                message_md += f"**From:** {sender}\n"
-                message_md += f"**To:** {recipient}\n"
-                message_md += f"**Subject:** {subject}\n"
-                message_md += f"**Date:** {date}\n\n"
-                message_md += body + "\n\n---\n\n"
-                messages_by_sender[sender].append(message_md)
+                if date:
+                    date = parsedate_to_datetime(date).isoformat()
+                recipients = message.get_recipients()
+                to_list, cc_list, bcc_list = [], [], []
+                for recipient in recipients:
+                    name, email = recipient.get_name(), recipient.get_email()
+                    recipient_type = recipient.get_type()
+                    if recipient_type == pypff.message_recipient_types.TO:
+                        to_list.append({"name": name, "email": email})
+                    elif recipient_type == pypff.message_recipient_types.CC:
+                        cc_list.append({"name": name, "email": email})
+                    elif recipient_type == pypff.message_recipient_types.BCC:
+                        bcc_list.append({"name": name, "email": email})
+                headers_str = json.dumps({
+                    "From": {"name": sender, "email": sender_email},
+                    "To": to_list,
+                    "Cc": cc_list,
+                    "Bcc": bcc_list,
+                    "Subject": subject,
+                    "Date": date
+                }, sort_keys=True)
+                content_for_hash = headers_str + (body or "")
+                email_unique_identifier = hashlib.sha256(content_for_hash.encode()).hexdigest()[:16]
+                return {
+                    "unique_identifier": email_unique_identifier,
+                    "sender": {"name": sender, "email": sender_email},
+                    "to": to_list,
+                    "cc": cc_list,
+                    "bcc": bcc_list,
+                    "subject": subject,
+                    "date": date,
+                    "body": body
+                }
+        async def process_folder(folder):
+            folder_tasks = []
+            for message in folder.sub_messages:
+                folder_tasks.append(asyncio.create_task(process_message(message)))
             for sub_folder in folder.sub_folders:
-                process_folder(sub_folder)
-        process_folder(root)
-        bundled_content = ""
-        for sender, messages in messages_by_sender.items():
-            bundled_content += f"# Emails from {sender}\n\n"
-            bundled_content += "".join(messages[:1000])  # Limit to 1000 messages per sender
-            if len(messages) > 1000:
-                bundled_content += f"\n\n*[{len(messages) - 1000} more messages not shown]*\n\n"
+                folder_tasks.extend(await process_folder(sub_folder))
+            return folder_tasks
+        tasks = await process_folder(root)
+        email_data_list = await asyncio.gather(*tasks)
+        for email_data in email_data_list:
+            if email_data:
+                emails_by_sender[email_data['sender']['email']].append(email_data)
         pst.close()
+        async def write_email_bundle(sender_email, emails):
+            safe_sender = ''.join(c.lower() if c.isalnum() else '_' for c in sender_email)
+            markdown_file_name = f"email_bundle__sender__{safe_sender}__category__pst_file.md"
+            markdown_file_path = os.path.join(converted_source_dir, markdown_file_name)
+            markdown_content = ""
+            for index, email in enumerate(emails[:MAX_EMAILS_PER_BUNDLE], 1):
+                markdown_content += f"# Email {index} of {len(emails[:MAX_EMAILS_PER_BUNDLE])} from {email['sender']['name']} <{email['sender']['email']}>\n\n"
+                markdown_content += f"**Unique Email Identifier:** {email['unique_identifier']}\n"
+                markdown_content += f"**From:** {email['sender']['name']} <{email['sender']['email']}>\n"
+                markdown_content += f"**To:** {', '.join([f'{r['name']} <{r['email']}>' for r in email['to']])}\n"
+                if email['cc']:
+                    markdown_content += f"**Cc:** {', '.join([f'{r['name']} <{r['email']}>' for r in email['cc']])}\n"
+                if email['bcc']:
+                    markdown_content += f"**Bcc:** {', '.join([f'{r['name']} <{r['email']}>' for r in email['bcc']])}\n"
+                markdown_content += f"**Subject:** {email['subject']}\n"
+                markdown_content += f"**Date:** {email['date']}\n\n"
+                markdown_content += f"**Body:**\n\n{email['body']}\n\n"
+                markdown_content += "---\n\n"
+            async with aiofiles.open(markdown_file_path, 'w', encoding='utf-8') as f:
+                await f.write(markdown_content)
+            logging.info(f"Created markdown file: {markdown_file_name}")
+        write_tasks = [write_email_bundle(sender_email, emails) for sender_email, emails in emails_by_sender.items()]
+        await asyncio.gather(*write_tasks)
         logging.info(f"Successfully processed PST file: {file_path}")
-        return bundled_content
+        return len(emails_by_sender)  # Return the number of email bundles created
     except Exception as e:
         logging.error(f"Error processing PST file {file_path}: {str(e)}")
         raise
 
+async def process_pst_files(original_source_dir: str, converted_source_dir: str):
+    for filename in os.listdir(original_source_dir):
+        if filename.lower().endswith('.pst'):
+            file_path = os.path.join(original_source_dir, filename)
+            logging.info(f"Processing MS Outlook PST file {file_path}")
+            number_of_email_bundle_files_created = await process_pst_file(file_path, converted_source_dir)
+            logging.info(f"Bundled {number_of_email_bundle_files_created} email bundles from {file_path}")
+            
 def process_iphone_messages(file_path: str) -> str:
     """
     Process iPhone messages database and bundle messages into markdown format.
@@ -2035,6 +2096,8 @@ async def preprocess_document(file_path: str) -> Tuple[str, str, Dict[str, Any],
             extracted_text = file.read()
         if file_path.lower().endswith('.md'):
             already_in_markdown = True
+            if 'email_bundle__sender__' in os.path.basename(file_path):
+                metadata['is_email_bundle'] = True            
     elif detected_mime_type.startswith('application/pdf') and robust_needs_ocr(file_path):
         logging.info(f"PDF {file_path} requires OCR. Starting OCR process...")
         images = convert_pdf_to_images_ocr(file_path)
@@ -2048,9 +2111,6 @@ async def preprocess_document(file_path: str) -> Tuple[str, str, Dict[str, Any],
     elif file_extension in ['.docx', '.doc', '.rtf', '.odt', '.pptx', '.ppt', '.csv', '.xlsx', '.xls', '.html', '.htm']:
         logging.info(f"Extracting text from {file_extension} document {file_path} using textract")
         extracted_text = textract.process(file_path, encoding='utf-8').decode('utf-8')
-    elif file_extension == '.pst' and detected_mime_type == 'application/vnd.ms-outlook':
-        logging.info(f"Processing MS Outlook PST file {file_path}")
-        extracted_text = process_pst_file(file_path)
     elif (file_extension == '.db' and 'sms' in file_path.lower()) or detected_mime_type == 'application/vnd.wap.mms-message':
         logging.info(f"Processing iPhone Messages database {file_path}")
         extracted_text = process_iphone_messages(file_path)
@@ -2727,6 +2787,9 @@ async def main():
         logging.info("Skipping conversion of source documents to plaintext...")
     else:
         # Step 2a: Convert source documents to plaintext
+        # Process MS Outlook PST files
+        logging.info("Now processing MS Outlook PST files...")
+        await process_pst_files(original_source_dir, converted_source_dir)
         logging.info("Now converting source documents to plaintext (and performing OCR if needed)...")
         await convert_documents_to_plaintext(original_source_dir, converted_source_dir)
     
