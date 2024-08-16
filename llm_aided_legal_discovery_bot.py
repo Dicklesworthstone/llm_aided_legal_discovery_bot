@@ -2,6 +2,7 @@ import os
 import glob
 import traceback
 import asyncio
+import aiofiles
 import multiprocessing
 from functools import partial
 from aiolimiter import AsyncLimiter
@@ -14,11 +15,10 @@ import sqlite3
 import zipfile
 import hashlib
 import warnings
-import email
+from email.utils import parseaddr, parsedate_to_datetime
 from email.parser import BytesParser
 from email.policy import default
-from email.utils import parseaddr, parsedate_to_datetime
-from collections import Counter
+from collections import Counter, defaultdict
 import urllib.request
 from typing import List, Dict, Tuple, Optional, Any
 from datetime import datetime
@@ -37,6 +37,8 @@ from pdf2image import convert_from_path
 import pytesseract
 from PIL import Image
 import cv2
+import pypff
+import markdown
 from llama_cpp import Llama, LlamaGrammar
 import tiktoken
 from filelock import FileLock, Timeout
@@ -106,9 +108,10 @@ def sophisticated_sentence_splitter(text: str) -> List[str]:
         refined_sentences[-1] += temp_sentence
     return [s.strip() for s in refined_sentences if s.strip()]
 
-def parse_email(file_path: str) -> Dict[str, Any]:
-    with open(file_path, 'rb') as file:
-        msg = BytesParser(policy=default).parse(file)
+async def parse_email_async(file_path: str) -> Dict[str, Any]:
+    async with aiofiles.open(file_path, 'rb') as file:
+        content = await file.read()
+    msg = BytesParser(policy=default).parsebytes(content)
     headers = {
         'From': msg['from'],
         'To': msg['to'],
@@ -129,13 +132,11 @@ def parse_email(file_path: str) -> Dict[str, Any]:
         'headers': headers,
         'body': body
     }
-    
-def parse_enron_email(file_path: str) -> Dict[str, Any]:
-    with open(file_path, 'r', encoding='utf-8', errors='ignore') as file:
-        content = file.read()
-    # Parse the email content
-    msg = email.message_from_string(content)
-    # Extract basic headers
+
+async def parse_enron_email_async(file_path: str) -> Dict[str, Any]:
+    async with aiofiles.open(file_path, 'rb') as file:
+        content = await file.read()
+    msg = BytesParser(policy=default).parsebytes(content)
     headers = {
         'From': msg['from'],
         'To': msg['to'],
@@ -147,31 +148,25 @@ def parse_enron_email(file_path: str) -> Dict[str, Any]:
         'X-Origin': msg['X-Origin'],
         'X-FileName': msg['X-FileName'],
     }
-    # Clean up and normalize headers
     for key, value in headers.items():
         if value:
-            headers[key] = ' '.join(value.split())  # Remove extra whitespace
-    # Parse the 'From' field to extract name and email
+            headers[key] = ' '.join(str(value).split())
     from_name, from_email = parseaddr(headers['From'])
     headers['From'] = {'name': from_name, 'email': from_email}
-    # Parse the 'To' field to extract multiple recipients
     if headers['To']:
         headers['To'] = [{'name': name, 'email': email} for name, email in [parseaddr(addr) for addr in headers['To'].split(',')]]
     else:
         headers['To'] = []
-    # Parse the 'Cc' and 'Bcc' fields similarly
     for field in ['Cc', 'Bcc']:
         if headers[field]:
-            headers[field] = [{'name': name, 'email': email} for name, email in [parseaddr(addr) for addr in headers[field].split(',')]]
+            headers[field] = [{'name': name, 'email': email} for name, email in [parseaddr(addr) for addr in str(headers[field]).split(',')]]
         else:
             headers[field] = []
-    # Convert date to a standard format
     if headers['Date']:
         try:
             headers['Date'] = parsedate_to_datetime(headers['Date']).isoformat()
         except:  # noqa: E722
-            pass  # Keep the original date string if parsing fails
-    # Extract the body
+            pass
     body = ""
     if msg.is_multipart():
         for part in msg.walk():
@@ -179,32 +174,38 @@ def parse_enron_email(file_path: str) -> Dict[str, Any]:
                 body += part.get_payload(decode=True).decode('utf-8', errors='ignore')
     else:
         body = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
-    # Clean up the body
     body = re.sub(r'\s+', ' ', body).strip()
     return {
         'headers': headers,
         'body': body
     }
 
-def process_enron_maildir(maildir_path: str) -> List[Dict[str, Any]]:
+async def process_enron_maildir_async(maildir_path: str, max_concurrent: int = 100) -> List[Dict[str, Any]]:
+    semaphore = asyncio.Semaphore(max_concurrent)
     emails = []
-    for root, dirs, files in os.walk(maildir_path):
+    async def process_file(file_path: str):
+        async with semaphore:
+            try:
+                email_data = await parse_enron_email_async(file_path)
+                email_data['file_path'] = file_path
+                return email_data
+            except Exception as e:
+                print(f"Error processing {file_path}: {str(e)}")
+                return None
+    tasks = []
+    for root, _, files in os.walk(maildir_path):
         for file in files:
-            if file.endswith('.'):  # Enron maildir files don't have extensions
-                file_path = os.path.join(root, file)
-                try:
-                    email_data = parse_enron_email(file_path)
-                    email_data['file_path'] = file_path
-                    emails.append(email_data)
-                except Exception as e:
-                    print(f"Error processing {file_path}: {str(e)}")
+            file_path = os.path.join(root, file)
+            tasks.append(asyncio.create_task(process_file(file_path)))
+    results = await asyncio.gather(*tasks)
+    emails = [email for email in results if email is not None]  # noqa: F811
     return emails
 
 async def parse_document_into_sentences(file_path: str, mime_type: str) -> Tuple[List[str], float, Dict[str, Any]]:
     content = ""
     email_metadata = {}
     if mime_type == 'message/rfc822':  # This is an email file
-        email_content = parse_email(file_path)
+        email_content = parse_email_async(file_path)
         email_metadata = email_content['headers']
         content = f"From: {email_metadata['From']}\nTo: {email_metadata['To']}\nSubject: {email_metadata['Subject']}\nDate: {email_metadata['Date']}\n\n{email_content['body']}"
     else:
@@ -282,6 +283,50 @@ async def download_and_extract_enron_emails_dataset(url: str, destination_folder
         logging.error("Failed to locate the final Maildir")
         return None
 
+async def process_extracted_enron_emails(maildir_path: str, converted_source_dir: str, turn_enron_email_archive_into_individual_converted_markdown_files_per_sender: bool):
+    logging.info(f"Now processing extracted Enron email corpus from {maildir_path}")
+    enron_emails = await process_enron_maildir_async(maildir_path)
+    if turn_enron_email_archive_into_individual_converted_markdown_files_per_sender:
+        sender_emails = {}
+        for email_data in enron_emails:
+            sender = email_data['headers']['From']['email']
+            if sender not in sender_emails:
+                sender_emails[sender] = []
+            sender_emails[sender].append(email_data)
+        async def write_sender_file(sender: str, emails: List[Dict[str, Any]]):
+            markdown_content = ""
+            for email_data in emails:
+                markdown_content += f"From: {email_data['headers']['From']['name']} <{email_data['headers']['From']['email']}>\n"
+                markdown_content += f"To: {', '.join([f'{r['name']} <{r['email']}>' for r in email_data['headers']['To']])}\n"
+                markdown_content += f"Subject: {email_data['headers']['Subject']}\n"
+                markdown_content += f"Date: {email_data['headers']['Date']}\n\n"
+                markdown_content += email_data['body']
+                markdown_content += "\n\n---\n\n"
+            safe_sender = ''.join(c if c.isalnum() else '_' for c in sender)
+            markdown_file_path = os.path.join(converted_source_dir, f"{safe_sender}_emails.md")
+            async with aiofiles.open(markdown_file_path, 'w', encoding='utf-8') as f:
+                await f.write(markdown_content)
+            logging.info(f"Created markdown file for sender: {sender}")
+        tasks = [write_sender_file(sender, emails) for sender, emails in sender_emails.items()]
+        await asyncio.gather(*tasks)
+    else:
+        async def write_email_file(email_data: Dict[str, Any]):
+            file_path = email_data['file_path']
+            content = f"From: {email_data['headers']['From']['name']} <{email_data['headers']['From']['email']}>\n"
+            content += f"To: {', '.join([f'{r['name']} <{r['email']}>' for r in email_data['headers']['To']])}\n"
+            content += f"Subject: {email_data['headers']['Subject']}\n"
+            content += f"Date: {email_data['headers']['Date']}\n\n"
+            content += email_data['body']
+            base_name = os.path.relpath(file_path, maildir_path).replace('/', '_')
+            converted_file_path = os.path.join(converted_source_dir, f"{base_name}.txt")
+            os.makedirs(os.path.dirname(converted_file_path), exist_ok=True)
+            async with aiofiles.open(converted_file_path, 'w', encoding='utf-8') as f:
+                await f.write(content)
+            logging.info(f"Converted Enron email: {file_path}")
+        tasks = [write_email_file(email_data) for email_data in enron_emails]
+        await asyncio.gather(*tasks)
+    logging.info("Finished processing Enron email corpus")
+    
 async def process_enron_email_corpus(
     project_root: str,
     original_source_dir: str,
@@ -298,54 +343,14 @@ async def process_enron_email_corpus(
         subdirs = [d for d in os.listdir(maildir_path) if os.path.isdir(os.path.join(maildir_path, d))]
         if len(subdirs) == 150:
             logging.info("Enron email corpus already extracted and present. Skipping download and extraction.")
-            return process_extracted_emails(maildir_path, converted_source_dir, turn_enron_email_archive_into_individual_converted_markdown_files_per_sender)
+            return await process_extracted_enron_emails(maildir_path, converted_source_dir, turn_enron_email_archive_into_individual_converted_markdown_files_per_sender)
     # If we don't have the complete extracted data, proceed with download and extraction
     logging.info("Downloading and extracting Enron dataset...")
     maildir_path = await download_and_extract_enron_emails_dataset(enron_dataset_url, enron_dataset_dir)
     if not maildir_path or not os.path.exists(maildir_path):
         logging.error("Failed to download or extract Enron dataset. Skipping Enron email processing.")
         return
-    return process_extracted_emails(maildir_path, converted_source_dir, turn_enron_email_archive_into_individual_converted_markdown_files_per_sender)
-
-def process_extracted_emails(maildir_path, converted_source_dir, turn_enron_email_archive_into_individual_converted_markdown_files_per_sender):
-    logging.info(f"Now processing extracted Enron email corpus from {maildir_path}")
-    enron_emails = process_enron_maildir(maildir_path)
-    if turn_enron_email_archive_into_individual_converted_markdown_files_per_sender:
-        sender_emails = {}
-        for email_data in enron_emails:
-            sender = email_data['headers']['From']['email']
-            if sender not in sender_emails:
-                sender_emails[sender] = []
-            sender_emails[sender].append(email_data)
-        for sender, emails in sender_emails.items():
-            markdown_content = ""
-            for email_data in emails:
-                markdown_content += f"From: {email_data['headers']['From']['name']} <{email_data['headers']['From']['email']}>\n"
-                markdown_content += f"To: {', '.join([f'{r['name']} <{r['email']}>' for r in email_data['headers']['To']])}\n"
-                markdown_content += f"Subject: {email_data['headers']['Subject']}\n"
-                markdown_content += f"Date: {email_data['headers']['Date']}\n\n"
-                markdown_content += email_data['body']
-                markdown_content += "\n\n---\n\n"
-            safe_sender = ''.join(c if c.isalnum() else '_' for c in sender)
-            markdown_file_path = os.path.join(converted_source_dir, f"{safe_sender}_emails.md")
-            with open(markdown_file_path, 'w', encoding='utf-8') as f:
-                f.write(markdown_content)
-            logging.info(f"Created markdown file for sender: {sender}")
-    else:
-        for email_data in enron_emails:
-            file_path = email_data['file_path']
-            content = f"From: {email_data['headers']['From']['name']} <{email_data['headers']['From']['email']}>\n"
-            content += f"To: {', '.join([f'{r['name']} <{r['email']}>' for r in email_data['headers']['To']])}\n"
-            content += f"Subject: {email_data['headers']['Subject']}\n"
-            content += f"Date: {email_data['headers']['Date']}\n\n"
-            content += email_data['body']
-            base_name = os.path.relpath(file_path, maildir_path).replace('/', '_')
-            converted_file_path = os.path.join(converted_source_dir, f"{base_name}.txt")
-            os.makedirs(os.path.dirname(converted_file_path), exist_ok=True)
-            with open(converted_file_path, 'w', encoding='utf-8') as f:
-                f.write(content)
-            logging.info(f"Converted Enron email: {file_path}")
-    logging.info("Finished processing Enron email corpus")
+    return await process_extracted_enron_emails(maildir_path, converted_source_dir, turn_enron_email_archive_into_individual_converted_markdown_files_per_sender)
 
 
 ##########################################################################
@@ -1817,36 +1822,237 @@ def load_processed_files(save_path: str) -> Dict[str, str]:
             return json.load(f)
     return {}
 
-async def preprocess_document(file_path: str) -> Tuple[str, str, Dict[str, Any]]:
+def process_pst_file(file_path: str) -> str:
+    """
+    Process Outlook PST files and bundle messages into markdown format.
+    """
+    logging.info(f"Processing PST file: {file_path}")
+    try:
+        pst = pypff.file()
+        pst.open(file_path)
+        root = pst.get_root_folder()
+        messages_by_sender = defaultdict(list)
+        def process_folder(folder):
+            for message in folder.sub_messages:
+                sender = message.get_sender_name()
+                subject = message.get_subject()
+                body = message.get_plain_text_body()
+                date = message.get_delivery_time()
+                recipient = message.get_recipients()
+                recipient = recipient[0].get_email() if recipient else "Unknown"
+                message_md = "## Email\n\n"
+                message_md += f"**From:** {sender}\n"
+                message_md += f"**To:** {recipient}\n"
+                message_md += f"**Subject:** {subject}\n"
+                message_md += f"**Date:** {date}\n\n"
+                message_md += body + "\n\n---\n\n"
+                messages_by_sender[sender].append(message_md)
+            for sub_folder in folder.sub_folders:
+                process_folder(sub_folder)
+        process_folder(root)
+        bundled_content = ""
+        for sender, messages in messages_by_sender.items():
+            bundled_content += f"# Emails from {sender}\n\n"
+            bundled_content += "".join(messages[:1000])  # Limit to 1000 messages per sender
+            if len(messages) > 1000:
+                bundled_content += f"\n\n*[{len(messages) - 1000} more messages not shown]*\n\n"
+        pst.close()
+        logging.info(f"Successfully processed PST file: {file_path}")
+        return bundled_content
+    except Exception as e:
+        logging.error(f"Error processing PST file {file_path}: {str(e)}")
+        raise
+
+def process_iphone_messages(file_path: str) -> str:
+    """
+    Process iPhone messages database and bundle messages into markdown format.
+    """
+    logging.info(f"Processing iPhone messages database: {file_path}")
+    try:
+        conn = sqlite3.connect(file_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT 
+                datetime(message.date/1000000000 + strftime("%s", "2001-01-01"), "unixepoch", "localtime") as date,
+                message.text,
+                handle.id as contact
+            FROM 
+                message 
+                LEFT JOIN handle ON message.handle_id = handle.ROWID 
+            ORDER BY 
+                date
+        """)
+        messages = cursor.fetchall()
+        conn.close()
+        bundled_content = "# iPhone Messages\n\n"
+        for date, text, contact in messages:
+            bundled_content += f"**Date:** {date}\n"
+            bundled_content += f"**Contact:** {contact}\n"
+            bundled_content += f"**Message:** {text}\n\n---\n\n"
+        logging.info(f"Successfully processed iPhone messages database: {file_path}")
+        return bundled_content
+    except Exception as e:
+        logging.error(f"Error processing iPhone messages database {file_path}: {str(e)}")
+        raise
+
+def process_android_messages(file_path: str) -> str:
+    """
+    Process Android messages database and bundle messages into markdown format.
+    """
+    logging.info(f"Processing Android messages database: {file_path}")
+    try:
+        conn = sqlite3.connect(file_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT 
+                datetime(date/1000, "unixepoch", "localtime") as date,
+                body,
+                address
+            FROM 
+                sms
+            ORDER BY 
+                date
+        """)
+        messages = cursor.fetchall()
+        conn.close()
+        bundled_content = "# Android Messages\n\n"
+        for date, body, address in messages:
+            bundled_content += f"**Date:** {date}\n"
+            bundled_content += f"**Contact:** {address}\n"
+            bundled_content += f"**Message:** {body}\n\n---\n\n"
+        logging.info(f"Successfully processed Android messages database: {file_path}")
+        return bundled_content
+    except Exception as e:
+        logging.error(f"Error processing Android messages database {file_path}: {str(e)}")
+        raise
+
+async def beautify_and_format_as_markdown(text: str) -> str:
+    logging.info(f"Beautifying and formatting text as markdown (length: {len(text):,} characters); first 100 characters of source text: {text[:100]}")
+    async def process_text(text: str, prompt_template: str, max_chunk_size: int = 2000) -> str:
+        text = escape_special_characters(text)
+        model_name = OPENAI_COMPLETION_MODEL if API_PROVIDER == "OPENAI" else CLAUDE_MODEL_STRING
+        if estimate_tokens(text, model_name) <= max_chunk_size:
+            prompt = prompt_template.format(text=text)
+            max_tokens = min(2048, 4096 - estimate_tokens(prompt, model_name))
+            return await generate_completion(prompt, max_tokens=max_tokens)
+        parts = []
+        chunks = chunk_text(text, max_chunk_size, model_name)
+        for chunk in chunks:
+            prompt = prompt_template.format(text=chunk)
+            max_tokens = min(2048, 4096 - estimate_tokens(prompt, model_name))
+            processed_part = await generate_completion(prompt, max_tokens=max_tokens)
+            parts.append(processed_part)
+        return "\n\n".join(parts)
+    # Markdown formatting template
+    markdown_template = """IMPORTANT: You are formatting a document for legal discovery. The integrity and accuracy of the original content are PARAMOUNT. Your task is ONLY to improve the formatting and readability using markdown, WITHOUT altering the original content in any way.
+
+Reformat the following text as markdown, improving readability while preserving the approximate original structure and content EXACTLY. Follow these guidelines STRICTLY:
+
+1. Convert existing headings to appropriate markdown heading levels (# for main titles, ## for subtitles, etc.)
+2. Ensure each heading is on its own line with a blank line before and after
+3. Maintain the EXACT original paragraph structure
+4. Format existing lists properly (unordered or ordered) if they exist in the original text
+5. Use emphasis (*italic*) and strong emphasis (**bold**) ONLY where they clearly exist in the original text
+6. PRESERVE ALL ORIGINAL CONTENT AND MEANING EXACTLY - DO NOT ADD, REMOVE, OR CHANGE ANY WORDS
+7. DO NOT add any extra punctuation or modify the existing punctuation
+8. DO NOT add any introductory text, preamble, or markdown code block indicators
+9. If tables are present, format them using markdown table syntax WITHOUT changing the content
+10. For code snippets or technical content, use appropriate markdown code block formatting
+
+WARNING: DO NOT GENERATE ANY NEW CONTENT. DO NOT SUMMARIZE. DO NOT EXPLAIN. ONLY FORMAT THE EXISTING TEXT.
+
+CRITICAL: If you are unsure about any formatting decision, ALWAYS err on the side of preserving the original text exactly as it is.
+
+Text to reformat:
+
+{text}
+
+Reformatted markdown (START DIRECTLY WITH THE CONTENT, NO PREAMBLE):
+"""
+    # Final filtering template
+    filtering_template = """CRITICAL: You are reviewing a document formatted for legal discovery. The EXACT preservation of the original content is ESSENTIAL. Your task is ONLY to refine the markdown formatting, ensuring it adheres to best practices WITHOUT altering the original content in any way.
+
+Review the following markdown-formatted text and refine it further. Follow these guidelines STRICTLY:
+
+1. Ensure consistent heading levels and proper nesting WITHOUT changing the heading text
+2. Verify that lists are properly formatted and indented WITHOUT altering list items
+3. Check that emphasis and strong emphasis are used ONLY where clearly intended in the original
+4. Ensure proper spacing between different elements (paragraphs, lists, headings) WITHOUT merging or splitting content
+5. Verify that any code blocks or technical content are properly formatted WITHOUT changing the code
+6. Ensure that tables, if present, are properly aligned and formatted WITHOUT altering table content
+7. Remove any trailing whitespace or unnecessary blank lines
+8. DO NOT remove any actual content or alter the meaning of the text in ANY WAY
+
+WARNING: Your role is SOLELY to refine formatting. DO NOT add explanations, summaries, or any new content.
+
+IMPORTANT: If there's any doubt about formatting, ALWAYS prioritize preserving the original text exactly as it is.
+
+Text to refine:
+
+{text}
+
+Refined markdown (START DIRECTLY WITH THE CONTENT, NO PREAMBLE):
+"""
+    markdown_formatted = await process_text(text, markdown_template)
+    refined_markdown = await process_text(markdown_formatted, filtering_template)
+    logging.info(f"Text beautified and formatted as markdown. Output length: {len(refined_markdown):,} characters")
+    return refined_markdown
+
+async def preprocess_document(file_path: str) -> Tuple[str, str, Dict[str, Any], bool]:
     with open(file_path, 'rb') as file:
         file_content = file.read()
         result = magika.identify_bytes(file_content)
         detected_mime_type = result.output.mime_type
     logging.info(f"Detected MIME type for {file_path}: {detected_mime_type}")
+    file_extension = os.path.splitext(file_path)[1].lower()
     metadata = {}
     used_smart_ocr = False
-    if detected_mime_type.startswith('application/pdf') and robust_needs_ocr(file_path):
+    if file_path.lower().endswith(('.md', '.txt')) or detected_mime_type in ['text/plain', 'text/markdown']:
+        logging.info(f"Reading text directly from {file_path}")
+        with open(file_path, 'r', encoding='utf-8') as file:
+            extracted_text = file.read()
+    elif detected_mime_type.startswith('application/pdf') and robust_needs_ocr(file_path):
         logging.info(f"PDF {file_path} requires OCR. Starting OCR process...")
         images = convert_pdf_to_images_ocr(file_path)
         with ThreadPoolExecutor() as executor:
             extracted_text_list = list(executor.map(ocr_image, images))
         extracted_text = await process_document_ocr(extracted_text_list)
         used_smart_ocr = True
-    elif detected_mime_type.startswith('image/'):
+    elif detected_mime_type.startswith('image/') or file_extension in ['.jpg', '.jpeg', '.png', '.tiff', '.bmp', '.gif']:
         logging.info(f"Performing OCR on image {file_path}")
         extracted_text = perform_simple_ocr_on_image(file_path)
+    elif file_extension in ['.docx', '.doc', '.rtf', '.odt', '.pptx', '.ppt', '.csv', '.xlsx', '.xls', '.html', '.htm']:
+        logging.info(f"Extracting text from {file_extension} document {file_path} using textract")
+        extracted_text = textract.process(file_path, encoding='utf-8').decode('utf-8')
+    elif file_extension == '.pst' and detected_mime_type == 'application/vnd.ms-outlook':
+        logging.info(f"Processing MS Outlook PST file {file_path}")
+        extracted_text = process_pst_file(file_path)
+    elif (file_extension == '.db' and 'sms' in file_path.lower()) or detected_mime_type == 'application/vnd.wap.mms-message':
+        logging.info(f"Processing iPhone Messages database {file_path}")
+        extracted_text = process_iphone_messages(file_path)
+    elif (file_extension == '.db' and 'mmssms' in file_path.lower()) or detected_mime_type == 'application/vnd.android.mms': 
+        logging.info(f"Processing Android Messages database {file_path}")
+        extracted_text = process_android_messages(file_path)        
     elif detected_mime_type == 'message/rfc822':
         logging.info(f"Processing email file {file_path}")
-        email_content = parse_email(file_path)
+        email_content = await parse_email_async(file_path)
         metadata = email_content['headers']
         extracted_text = f"From: {metadata['From']}\nTo: {metadata['To']}\nSubject: {metadata['Subject']}\nDate: {metadata['Date']}\n\n{email_content['body']}"
     else:
-        logging.info(f"Extracting text from {file_path} using textract")
-        extracted_text = textract.process(file_path, encoding='utf-8').decode('utf-8')
+        logging.info(f"Attempting to extract text from {file_path} using textract") 
+        try:
+            extracted_text = textract.process(file_path, encoding='utf-8').decode('utf-8')
+            logging.info(f"Successfully extracted text from {file_path} using textract")
+        except Exception as e:
+            logging.error(f"Error extracting text from {file_path} using textract: {str(e)}")
+            extracted_text = f"Error extracting text from {file_path} using textract: {str(e)}"
     # Post-processing
     extracted_text = remove_pagination_breaks(extracted_text)
     sentences = sophisticated_sentence_splitter(extracted_text)
     processed_text = "\n".join(sentences)
+    # Apply beautification and markdown formatting for non-OCR processed documents (since these already have markdown formatting)
+    if not used_smart_ocr:
+        processed_text = await beautify_and_format_as_markdown(processed_text)
     return processed_text, detected_mime_type, metadata, used_smart_ocr
 
 async def convert_documents_to_plaintext(original_source_dir: str, converted_source_dir: str):
@@ -1917,7 +2123,7 @@ async def convert_documents_to_plaintext(original_source_dir: str, converted_sou
 async def check_corrupted_output_file(file_path: str, original_file_path: str, max_retries: int = 3) -> dict:
     """
     Check if the output file is likely corrupted or unusable due to failed OCR.
-    Includes retry mechanism and validation checks.
+    Uses a more conservative approach to avoid false positives.
     
     :param file_path: Path to the processed output file
     :param original_file_path: Path to the original input file
@@ -1948,12 +2154,13 @@ async def check_corrupted_output_file(file_path: str, original_file_path: str, m
         return True
     with open(file_path, 'r', encoding='utf-8') as file:
         content = file.read()
-    prompt = f"""Analyze the following text content from a processed document and determine if it's likely corrupted or unusable due to failed OCR. Consider these factors:
+    prompt = f"""Carefully analyze the following text content from a processed document and determine if it's likely corrupted or unusable due to failed OCR. Be very conservative in your assessment - only flag as corrupted if there are clear and significant issues. Consider these factors:
 
-1. Presence of random characters or non-readable text
-2. Lack of coherent sentences or paragraphs
-3. Excessive repetition of patterns or characters
-4. Presence of OCR artifacts like misinterpreted characters
+1. Presence of a VERY high proportion of random characters or non-readable text
+2. Complete lack of coherent sentences or recognizable words
+3. Excessive and meaningless repetition of patterns or characters
+
+Remember, the content might be fragmentary or contain specialized terms, so don't flag it as corrupted unless you're very certain. The bar for classifying as corrupted is VERY high, so if you're not sure, err on the side of caution.
 
 Text content:
 {content[:3000]}  # Limiting to first 3000 characters for brevity
@@ -1968,12 +2175,20 @@ USABILITY_SCORE: [0-100, where 0 is completely unusable and 100 is perfect]
             response = await generate_completion(prompt)
             analysis = parse_llm_response_for_corruption_check(response)
             if validate_corruption_analysis_result(analysis):
+                is_corrupted = analysis['CORRUPTED'].lower() == 'yes'
+                usability_score = int(analysis['USABILITY_SCORE'])
+                
+                # Additional safeguard: only consider it corrupted if usability is very low
+                if is_corrupted and usability_score > 20:
+                    is_corrupted = False
+                    analysis['EXPLANATION'] += " However, the usability score suggests the content may still be valuable."
+
                 return {
                     'input_file': original_file_path,
                     'output_file': file_path,
-                    'is_corrupted': analysis['CORRUPTED'].lower() == 'yes',
+                    'is_corrupted': is_corrupted,
                     'explanation': analysis['EXPLANATION'],
-                    'usability_score': int(analysis['USABILITY_SCORE'])
+                    'usability_score': usability_score
                 }
             else:
                 logging.warning(f"Invalid LLM response on attempt {attempt + 1}. Retrying...")
@@ -1985,9 +2200,9 @@ USABILITY_SCORE: [0-100, where 0 is completely unusable and 100 is perfect]
     return {
         'input_file': original_file_path,
         'output_file': file_path,
-        'is_corrupted': True,
-        'explanation': 'Failed to analyze due to repeated errors',
-        'usability_score': 0
+        'is_corrupted': False,  # Default to not corrupted if analysis fails
+        'explanation': 'Failed to analyze due to repeated errors, assuming not corrupted',
+        'usability_score': 50  # Neutral score if analysis fails
     }
 
 async def process_output_directory_to_check_for_corrupted_or_failed_files(output_dir: str, original_dir: str, max_concurrent: int = 5):
@@ -1999,7 +2214,7 @@ async def process_output_directory_to_check_for_corrupted_or_failed_files(output
             base_name = os.path.splitext(filename)[0]
             # Try to find the original file with any extension
             original_file_path = None
-            for ext in ['.pdf', '.txt', '.docx', '.doc', '.rtf', '.odt', '']:
+            for ext in ['.pdf', '.txt', '.docx', '.doc', '.rtf', '.odt', '.pst', '.db', '.xlsx', '.xls', '.pptx', '.ppt', '.csv', '.html', '.htm', '.jpg', '.jpeg', '.png', '.tiff', '.bmp', '.gif', '']:
                 potential_path = os.path.join(original_dir, base_name + ext)
                 if os.path.exists(potential_path):
                     original_file_path = potential_path
@@ -2028,25 +2243,38 @@ async def process_output_directory_to_check_for_corrupted_or_failed_files(output
         return [result for result in await asyncio.gather(*tasks) if result is not None]
     try:
         all_results = await process_all_files()
-        new_corrupted_files = [result for result in all_results if result['is_corrupted'] or result['usability_score'] < 50]
         # Read existing data
-        existing_corrupted_files = []
+        existing_corrupted_files = {}
         if os.path.exists(LIKELY_CORRUPTED_OUTPUT_FILES_JSON_PATH):
             with open(LIKELY_CORRUPTED_OUTPUT_FILES_JSON_PATH, 'r') as f:
-                existing_corrupted_files = json.load(f)
-        # Combine existing and new data
-        combined_corrupted_files = existing_corrupted_files + new_corrupted_files
-        # Remove duplicates based on 'output_file' path
-        unique_corrupted_files = {file['output_file']: file for file in combined_corrupted_files}.values()
-        # Save the combined list of corrupted files
+                existing_corrupted_files = {file['output_file']: file for file in json.load(f)}
+        # Update existing entries and add new ones
+        updated_corrupted_files = {}
+        minimum_usability_score_to_flag_as_corrupted = 20
+        for result in all_results:
+            if result['is_corrupted'] or result['usability_score'] < minimum_usability_score_to_flag_as_corrupted:
+                updated_corrupted_files[result['output_file']] = result
+            elif result['output_file'] in existing_corrupted_files:
+                logging.info(f"File {result['output_file']} is no longer considered corrupted. Removing from list.")
+        # Add any existing corrupted files that weren't processed this time
+        for file_path, file_data in existing_corrupted_files.items():
+            if file_path not in updated_corrupted_files and os.path.exists(file_path):
+                updated_corrupted_files[file_path] = file_data
+        # Convert to list for JSON serialization
+        final_corrupted_files = list(updated_corrupted_files.values())
+        # Save the updated list of corrupted files
         with open(LIKELY_CORRUPTED_OUTPUT_FILES_JSON_PATH, 'w') as f:
-            json.dump(list(unique_corrupted_files), f, indent=2)
-        logging.info(f"Identified {len(new_corrupted_files)} new potentially corrupted or unusable files out of {len(all_results)} processed.")
-        logging.info(f"Total corrupted files after update: {len(unique_corrupted_files)}")
+            json.dump(final_corrupted_files, f, indent=2)
+        new_corrupted_count = sum(1 for file in final_corrupted_files if file['output_file'] not in existing_corrupted_files)
+        removed_count = sum(1 for file in existing_corrupted_files if file not in updated_corrupted_files)
+        logging.info(f"Identified {new_corrupted_count} new potentially corrupted or unusable files out of {len(all_results)} processed.")
+        logging.info(f"Removed {removed_count} files that are no longer considered corrupted.")
+        logging.info(f"Total corrupted files after update: {len(final_corrupted_files)}")
         logging.info(f"Results saved to {LIKELY_CORRUPTED_OUTPUT_FILES_JSON_PATH}")
+        return final_corrupted_files
     except Exception as e:
         logging.error(f"An error occurred while processing the output directory: {str(e)}")
-    return list(unique_corrupted_files)
+        return []
 
 async def process_difficult_pdf_with_gpt4_vision(file_path: str) -> str:
     images = convert_pdf_to_images_ocr(file_path)
@@ -2481,15 +2709,31 @@ async def main():
     # Step 2b: Check for corrupted/failed output files
     logging.info("Now checking for corrupted or failed output files...")
     await process_output_directory_to_check_for_corrupted_or_failed_files(converted_source_dir, original_source_dir)
+    
+    # Load and process the JSON file containing corrupted or failed files
+    with open(LIKELY_CORRUPTED_OUTPUT_FILES_JSON_PATH, 'r') as f:
+        corrupted_files_data = json.load(f)
+    list_of_corrupted_or_failed_files = [item['output_file'] for item in corrupted_files_data]
+    total_size = sum(os.path.getsize(file_path) for file_path in list_of_corrupted_or_failed_files if os.path.exists(file_path))
+    logging.info(f"Found {len(list_of_corrupted_or_failed_files)} corrupted or failed output files, with a total data size of {total_size / 1024 / 1024:.4f} MB")
+        
+    use_delete_corrupted_or_failed_files = 1
+    if use_delete_corrupted_or_failed_files:
+        # Delete corrupted or failed output files
+        logging.info(f"Deleting {len(list_of_corrupted_or_failed_files)} corrupted or failed output files...")
+        for file_path in list_of_corrupted_or_failed_files:
+            if os.path.exists(file_path):
+                file_size = os.path.getsize(file_path) / 1024 / 1024  # Size in MB
+                logging.info(f"Deleting corrupted or failed output file: {file_path} (size: {file_size:.4f} MB)")
+                os.remove(file_path)
+            else:
+                logging.warning(f"File not found, cannot delete: {file_path}")
+    
     if USE_GPT4_VISION_MODEL_FOR_FAILED_OR_CORRUPTED_FILES:
         # Step 2b.1: Process corrupted/failed output files with GPT-4 Vision instead of pytesseract
         logging.info("Now processing corrupted or failed output files that did not work well with pytesseract with GPT-4 Vision... (more expensive but more capable with difficult files like handwritten documents)")
         await process_corrupted_files_with_gpt4_vision(LIKELY_CORRUPTED_OUTPUT_FILES_JSON_PATH)
-                    
-    # New step: Create and populate a SQLite database for the discovery case containing converted documents and their metadata and other relevant information
-    logging.info("Creating and populating SQLite database containing converted documents and their metadata...")
-    create_and_populate_case_sqlite_database(config_file_path, converted_source_dir, original_source_dir)
-                        
+
     # Step 2c: Process Enron email corpus, turning the archive into individual markdown files per sender if desired
     if use_enron_example:
         await process_enron_email_corpus(
@@ -2499,6 +2743,10 @@ async def main():
             turn_enron_email_archive_into_individual_converted_markdown_files_per_sender=True  # or False
         )          
             
+    # Step 2d: Create and populate a SQLite database for the discovery case containing converted documents and their metadata and other relevant information
+    logging.info("Creating and populating SQLite database containing converted documents and their metadata...")
+    create_and_populate_case_sqlite_database(config_file_path, converted_source_dir, original_source_dir)
+                                    
     # Load the list of previously processed files
     processed_files_path = os.path.join(project_root, 'processed_files.json')
     processed_files = load_processed_files(processed_files_path)

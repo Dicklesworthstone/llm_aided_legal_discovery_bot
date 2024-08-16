@@ -4,9 +4,11 @@ backoff
 beautifulsoup4
 filelock
 httpx[http2]
+libpff-python
 llama-cpp-python
 lxml
 magika
+markdown
 numpy
 nvgpu
 openai
