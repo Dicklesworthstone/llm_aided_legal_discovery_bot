@@ -67,7 +67,7 @@ TOKEN_BUFFER = 500  # Buffer to account for token estimation inaccuracies
 TOKEN_CUSHION = 300 # Don't use the full max tokens to avoid hitting the limit
 OPENAI_COMPLETION_MODEL = config.get("OPENAI_COMPLETION_MODEL", default="gpt-4o-mini", cast=str)
 OPENAI_EMBEDDING_MODEL = config.get("OPENAI_EMBEDDING_MODEL", default="text-embedding-3-small", cast=str)
-OPENAI_MAX_TOKENS = 4096  # Maximum allowed tokens for OpenAI API
+OPENAI_MAX_TOKENS = 128000  # Context window for GPT-4o mini
 DEFAULT_LOCAL_MODEL_NAME = "Llama-3.1-8B-Lexi-Uncensored_Q5_fixedrope.gguf"
 LOCAL_LLM_CONTEXT_SIZE_IN_TOKENS = 2048
 USE_VERBOSE = False
@@ -388,7 +388,6 @@ def needs_ocr_pdf(pdf_path: str) -> bool:
     """
     Check if a PDF needs OCR by attempting multiple methods of text extraction.
     """
-    logging.info(f"Checking if PDF {pdf_path} needs OCR")
     try:
         with open(pdf_path, 'rb') as file:
             reader = PyPDF2.PdfReader(file)
@@ -407,24 +406,32 @@ def needs_ocr_pdf(pdf_path: str) -> bool:
     logging.info(f"PDF {pdf_path} likely needs OCR.")
     return True
 
+def resample_to_300_dpi(image: Image.Image) -> Image.Image:
+    dpi = 300
+    width_inch, height_inch = image.size[0] / dpi, image.size[1] / dpi
+    resampled_image = image.resize((int(width_inch * dpi), int(height_inch * dpi)), Image.LANCZOS)
+    return resampled_image
+
 def perform_simple_ocr_on_image(image_path: str) -> str:
     logging.info(f"Performing OCR on image: {image_path}")
-    image = cv2.imread(image_path)
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    # Apply thresholding to preprocess the image
+    image = Image.open(image_path)
+    resampled_image = resample_to_300_dpi(image)
+    # Convert to grayscale and prepare the image for OCR
+    gray = cv2.cvtColor(np.array(resampled_image), cv2.COLOR_BGR2GRAY)
     gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
     # Apply dilation to connect text components
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     gray = cv2.dilate(gray, kernel, iterations=1)
     # Perform text extraction
     text = pytesseract.image_to_string(gray)
     return text
 
 def preprocess_image_ocr(image):
-    gray = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2GRAY)
+    # Resample the image to 300 dpi (tesseract was trained on this resolution)
+    resampled_image = resample_to_300_dpi(image)
+    gray = cv2.cvtColor(np.array(resampled_image), cv2.COLOR_RGB2GRAY)
     gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
-    # Apply dilation to connect text components
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
+    kernel = np.ones((1, 1), np.uint8)
     gray = cv2.dilate(gray, kernel, iterations=1)
     return Image.fromarray(gray)
 
@@ -448,6 +455,38 @@ def ocr_image(image):
 def escape_special_characters(text):
     return text.replace('{', '{{').replace('}', '}}')
 
+async def process_text_with_llm(text: str, prompt_template: str, max_chunk_size: int = 1000, prev_context: str = "", escape_text: bool = True) -> str:
+    if escape_text:
+        text = escape_special_characters(text)
+    model_name = OPENAI_COMPLETION_MODEL if API_PROVIDER == "OPENAI" else CLAUDE_MODEL_STRING
+    async def process_chunk(chunk: str) -> str:
+        prompt = prompt_template.format(text=chunk, prev_context=prev_context)
+        max_tokens = min(2048, 4096 - estimate_tokens(prompt, model_name))
+        result = await generate_completion(prompt, max_tokens=max_tokens)
+        return result if result is not None else chunk
+    if estimate_tokens(text, model_name) <= max_chunk_size:
+        return await process_chunk(text)
+    parts = []
+    words = text.split()
+    current_part = []
+    current_tokens = 0
+    for word in words:
+        word_tokens = estimate_tokens(word, model_name)
+        if current_tokens + word_tokens > max_chunk_size:
+            part_text = " ".join(current_part)
+            processed_part = await process_chunk(part_text)
+            parts.append(processed_part)
+            current_part = [word]
+            current_tokens = word_tokens
+        else:
+            current_part.append(word)
+            current_tokens += word_tokens
+    if current_part:
+        part_text = " ".join(current_part)
+        processed_part = await process_chunk(part_text)
+        parts.append(processed_part)
+    return " ".join(parts)
+
 async def process_chunk_ocr(chunk: str, prev_context: str, chunk_index: int, total_chunks: int, reformat_as_markdown: bool, suppress_headers_and_page_numbers: bool) -> Tuple[str, str]:
     logging.info(f"Processing OCR chunk {chunk_index + 1}/{total_chunks} (length: {len(chunk):,} characters)")
     # Check if the chunk has enough content
@@ -456,38 +495,6 @@ async def process_chunk_ocr(chunk: str, prev_context: str, chunk_index: int, tot
         return "", prev_context
     context_length = min(250, len(prev_context))
     prev_context_short = prev_context[-context_length:]
-    # Function to process text in smaller parts
-    async def process_text(text: str, prompt_template: str, max_chunk_size: int = 1000) -> str:
-        text = escape_special_characters(text)
-        model_name = OPENAI_COMPLETION_MODEL if API_PROVIDER == "OPENAI" else CLAUDE_MODEL_STRING
-        if estimate_tokens(text, model_name) <= max_chunk_size:
-            prompt = prompt_template.format(text=text, prev_context=prev_context_short)
-            max_tokens = min(2048, 4096 - estimate_tokens(prompt, model_name))
-            return await generate_completion(prompt, max_tokens=max_tokens)
-        parts = []
-        words = text.split()
-        current_part = []
-        current_tokens = 0
-        for word in words:
-            word_tokens = estimate_tokens(word, model_name)
-            if current_tokens + word_tokens > max_chunk_size:
-                part_text = " ".join(current_part)
-                prompt = prompt_template.format(text=part_text, prev_context=prev_context_short)
-                max_tokens = min(2048, 4096 - estimate_tokens(prompt, model_name))
-                processed_part = await generate_completion(prompt, max_tokens=max_tokens)
-                parts.append(processed_part)
-                current_part = [word]
-                current_tokens = word_tokens
-            else:
-                current_part.append(word)
-                current_tokens += word_tokens
-        if current_part:
-            part_text = " ".join(current_part)
-            prompt = prompt_template.format(text=part_text, prev_context=prev_context_short)
-            max_tokens = min(2048, 4096 - estimate_tokens(prompt, model_name))
-            processed_part = await generate_completion(prompt, max_tokens=max_tokens)
-            parts.append(processed_part)
-        return " ".join(parts)
     # OCR correction prompt template
     ocr_correction_template = """Correct OCR-induced errors in the text, ensuring it flows coherently with the previous context. Follow these guidelines:
 
@@ -521,11 +528,8 @@ Current text to process:
 
 Corrected text:
 """
-    
-    ocr_corrected_chunk = await process_text(chunk, ocr_correction_template)
-    
+    ocr_corrected_chunk = await process_text_with_llm(chunk, ocr_correction_template, prev_context=prev_context_short)
     processed_chunk = ocr_corrected_chunk
-
     if reformat_as_markdown:
         markdown_template = """Reformat the following text as markdown, improving readability while preserving the original structure. Follow these guidelines:
 1. Preserve all original headings, converting them to appropriate markdown heading levels (# for main titles, ## for subtitles, etc.)
@@ -556,7 +560,8 @@ Text to reformat:
 Reformatted markdown:
 """
         suppress_instruction = "Carefully remove headers, footers, and page numbers while preserving all other content." if suppress_headers_and_page_numbers else "Identify but do not remove headers, footers, or page numbers. Instead, format them distinctly, e.g., as blockquotes."
-        processed_chunk = await process_text(ocr_corrected_chunk, markdown_template.format(text=ocr_corrected_chunk, suppress_instruction=suppress_instruction))
+        markdown_template_formatted = markdown_template.format(suppress_instruction=suppress_instruction, text="{text}")
+        processed_chunk = await process_text_with_llm(ocr_corrected_chunk, markdown_template_formatted, prev_context=prev_context_short)
 
     # Additional filtering stage
     filtering_template = """Review the following markdown-formatted text and remove any invalid or unwanted elements without altering the actual content. Follow these guidelines:
@@ -576,29 +581,16 @@ Text to filter:
 
 Filtered text:
 """
-    filtered_chunk = await process_text(processed_chunk, filtering_template)
+    filtered_chunk = await process_text_with_llm(processed_chunk, filtering_template, prev_context=prev_context_short)
     # Check if the final output is reasonably long
     if len(filtered_chunk.strip()) < 100:
         logging.warning(f"Chunk {chunk_index + 1}/{total_chunks} output is too short (less than 100 characters). This may indicate a processing issue.")
-        return "", prev_context
+        return chunk, prev_context  # Return original chunk if processed result is too short
     # Use dynamic context length for the next chunk
     new_context_length = min(500, len(filtered_chunk))
     new_context = filtered_chunk[-new_context_length:]
     logging.info(f"OCR Chunk {chunk_index + 1}/{total_chunks} processed. Output length: {len(filtered_chunk):,} characters")
     return filtered_chunk, new_context
-
-async def process_chunks_ocr(chunks: List[str], reformat_as_markdown: bool = True, suppress_headers_and_page_numbers: bool = True) -> List[str]:
-    total_chunks = len(chunks)
-    async def process_chunk_with_context(chunk: str, prev_context: str, index: int) -> Tuple[int, str, str]:
-        processed_chunk, new_context = await process_chunk_ocr(chunk, prev_context, index, total_chunks, reformat_as_markdown, suppress_headers_and_page_numbers)
-        return index, processed_chunk, new_context
-    context = ""
-    processed_chunks = []
-    for i, chunk in enumerate(chunks):
-        processed_chunk, context = await process_chunk_ocr(chunk, context, i, total_chunks, reformat_as_markdown, suppress_headers_and_page_numbers)
-        processed_chunks.append(processed_chunk)
-    logging.info(f"All {total_chunks} OCR chunks processed successfully")
-    return processed_chunks
 
 async def process_document_ocr(list_of_extracted_text_strings: List[str], reformat_as_markdown: bool = True, suppress_headers_and_page_numbers: bool = True) -> str:
     logging.info(f"Starting OCR document processing. Total pages: {len(list_of_extracted_text_strings):,}")
@@ -609,13 +601,13 @@ async def process_document_ocr(list_of_extracted_text_strings: List[str], reform
     chunks = []
     current_chunk = []
     current_chunk_length = 0
+    # Chunking logic (unchanged)
     for paragraph in paragraphs:
         paragraph_length = len(paragraph)
         if current_chunk_length + paragraph_length <= chunk_size:
             current_chunk.append(paragraph)
             current_chunk_length += paragraph_length
         else:
-            # If adding the whole paragraph exceeds the chunk size, we need to split the paragraph into sentences
             if current_chunk:
                 chunks.append("\n\n".join(current_chunk))
             sentences = re.split(r'(?<=[.!?])\s+', paragraph)
@@ -631,7 +623,6 @@ async def process_document_ocr(list_of_extracted_text_strings: List[str], reform
                         chunks.append(" ".join(current_chunk))
                     current_chunk = [sentence]
                     current_chunk_length = sentence_length
-    # Add any remaining content as the last chunk
     if current_chunk:
         chunks.append("\n\n".join(current_chunk) if len(current_chunk) > 1 else current_chunk[0])
     # Add overlap between chunks
@@ -639,20 +630,22 @@ async def process_document_ocr(list_of_extracted_text_strings: List[str], reform
         overlap_text = chunks[i-1].split()[-overlap:]
         chunks[i] = " ".join(overlap_text) + " " + chunks[i]
     logging.info(f"OCR document split into {len(chunks):,} chunks. Chunk size: {chunk_size:,}, Overlap: {overlap:,}")
-    # Process chunks with error handling
-    processed_chunks = []
-    for i, chunk in enumerate(chunks):
-        try:
-            logging.info(f"Processing chunk {i+1}/{len(chunks)}")
-            processed_chunk = await process_chunk_ocr(chunk, "", i, len(chunks), reformat_as_markdown, suppress_headers_and_page_numbers)
-            processed_chunks.append(processed_chunk[0])  # process_chunk_ocr returns a tuple, we want the first element
-            logging.info(f"Chunk {i+1}/{len(chunks)} processed successfully")
-        except Exception as e:
-            logging.error(f"Error processing chunk {i+1}/{len(chunks)}: {str(e)}")
-            logging.error(traceback.format_exc())
-            # Append original chunk if processing fails
-            processed_chunks.append(chunk)
-            logging.warning(f"Using original chunk for {i+1}/{len(chunks)} due to processing error")
+    # Concurrent processing of chunks
+    semaphore = asyncio.Semaphore(50)  # Limit concurrent processing to 50 chunks at a time
+    async def process_chunk_wrapper(chunk: str, index: int) -> str:
+        async with semaphore:
+            try:
+                logging.info(f"Processing chunk {index+1}/{len(chunks)}")
+                processed_chunk = await process_chunk_ocr(chunk, "", index, len(chunks), reformat_as_markdown, suppress_headers_and_page_numbers)
+                logging.info(f"Chunk {index+1}/{len(chunks)} processed successfully")
+                return processed_chunk[0]  # process_chunk_ocr returns a tuple, we want the first element
+            except Exception as e:
+                logging.error(f"Error processing chunk {index+1}/{len(chunks)}: {str(e)}")
+                logging.error(traceback.format_exc())
+                logging.warning(f"Using original chunk for {index+1}/{len(chunks)} due to processing error")
+                return chunk
+    # Use asyncio.gather to process chunks concurrently
+    processed_chunks = await asyncio.gather(*[process_chunk_wrapper(chunk, i) for i, chunk in enumerate(chunks)])
     final_text = "".join(processed_chunks)
     logging.info(f"Size of OCR text after combining chunks: {len(final_text):,} characters")
     logging.info(f"OCR document processing complete. Final text length: {len(final_text):,} characters")
@@ -1046,7 +1039,9 @@ async def generate_completion(prompt: str, max_tokens: int = 5000) -> Optional[s
         return None
 
 def get_tokenizer(model_name: str):
-    if model_name.startswith("gpt-"):
+    if model_name.startswith("gpt-4o"):
+        return tiktoken.encoding_for_model('gpt-4o')
+    elif model_name.startswith("gpt-"):
         return tiktoken.encoding_for_model(model_name)
     elif model_name.startswith("claude-"):
         return AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b", clean_up_tokenization_spaces=False)
@@ -1169,7 +1164,6 @@ async def generate_completion_from_claude(prompt: str, max_tokens: int = CLAUDE_
                 ) as stream:
                     message = await stream.get_final_message()
                     results.append(message.content[0].text)
-                    logging.info(f"Chunk processed. Input tokens: {message.usage.input_tokens:,}, Output tokens: {message.usage.output_tokens:,}")
             except Exception as e:
                 logging.error(f"An error occurred while processing a chunk: {e}")
         return " ".join(results)
@@ -1185,59 +1179,44 @@ async def generate_completion_from_claude(prompt: str, max_tokens: int = CLAUDE_
                 output_text = message.content[0].text
                 logging.info(f"Total input tokens: {message.usage.input_tokens:,}")
                 logging.info(f"Total output tokens: {message.usage.output_tokens:,}")
-                logging.info(f"Generated output (abbreviated): {output_text[:150]}...")
+                logging.info(f"Generated output (abbreviated): {' '.join(output_text[:150].replace('\\r', '').replace('\\n', '').split())}...")
                 return output_text
         except Exception as e:
             logging.error(f"An error occurred while requesting from Claude API: {e}")
             return None
 
-async def generate_completion_from_openai(prompt: str, max_tokens: int = 5000) -> Optional[str]:
+async def generate_completion_from_openai(prompt: str, max_tokens: int = 16384) -> Optional[str]:
     if not OPENAI_API_KEY:
         logging.error("OpenAI API key not found. Please set the OPENAI_API_KEY environment variable.")
         return None
     prompt_tokens = estimate_tokens(prompt, OPENAI_COMPLETION_MODEL)
-    adjusted_max_tokens = calculate_safe_max_tokens(prompt_tokens, OPENAI_MAX_TOKENS)
+    adjusted_max_tokens = min(max_tokens, OPENAI_MAX_TOKENS - prompt_tokens - TOKEN_BUFFER)
+    use_verbose_openai_logging = 0
+    if use_verbose_openai_logging:
+        logging.info(f"Prompt tokens: {prompt_tokens:,}")
+        logging.info(f"Max tokens allowed: {adjusted_max_tokens:,}")
+        logging.info(f"Total context length: {prompt_tokens + adjusted_max_tokens:,}")
     if adjusted_max_tokens <= 1:
-        logging.warning("Prompt is too long for OpenAI API. Chunking the input.")
-        chunks = chunk_text(prompt, OPENAI_MAX_TOKENS - TOKEN_CUSHION, OPENAI_COMPLETION_MODEL) 
-        results = []
-        for chunk in chunks:
-            try:
-                chunk_tokens = estimate_tokens(chunk, OPENAI_COMPLETION_MODEL)
-                chunk_max_tokens = calculate_safe_max_tokens(chunk_tokens, OPENAI_MAX_TOKENS)
-                response = await api_request_with_retry(
-                    openai_client.chat.completions.create,
-                    model=OPENAI_COMPLETION_MODEL,
-                    messages=[{"role": "user", "content": chunk}],
-                    max_tokens=chunk_max_tokens,
-                    temperature=0.7,
-                )
-                result = response.choices[0].message.content
-                results.append(result)
-                logging.info(f"Chunk processed. Output tokens: {response.usage.completion_tokens:,}")
-            except (RateLimitError, APIError) as e:
-                logging.error(f"OpenAI API error: {str(e)}")
-            except Exception as e:
-                logging.error(f"An unexpected error occurred while processing a chunk: {str(e)}")
-        return " ".join(results)
-    else:
-        try:
-            response = await api_request_with_retry(
-                openai_client.chat.completions.create,
-                model=OPENAI_COMPLETION_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=adjusted_max_tokens,
-                temperature=0.7,
-            )
-            output_text = response.choices[0].message.content
+        logging.warning(f"Prompt is too long for OpenAI API. Prompt tokens: {prompt_tokens:,}")
+        return prompt  # Return the original prompt if it's too long
+    try:
+        response = await api_request_with_retry(
+            openai_client.chat.completions.create,
+            model=OPENAI_COMPLETION_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=adjusted_max_tokens,
+            temperature=0.7,
+        )
+        output_text = response.choices[0].message.content
+        if use_verbose_openai_logging:
             logging.info(f"Total tokens: {response.usage.total_tokens:,}")
-            logging.info(f"Generated output (abbreviated): {output_text[:150]}...")
-            return output_text
-        except (RateLimitError, APIError) as e:
-            logging.error(f"OpenAI API error: {str(e)}")
-        except Exception as e:
-            logging.error(f"An unexpected error occurred while requesting from OpenAI API: {str(e)}")
-        return None
+            logging.info(f"Generated output (abbreviated): {' '.join(output_text[:150].replace('\\r', '').replace('\\n', '').split())}...")
+        return output_text
+    except (RateLimitError, APIError) as e:
+        logging.error(f"OpenAI API error: {str(e)}")
+    except Exception as e:
+        logging.error(f"An unexpected error occurred while requesting from OpenAI API: {str(e)}")
+    return prompt  # Return the original prompt if any error occurs
     
 async def generate_completion_from_local_llm(llm_model_name: str, input_prompt: str, number_of_tokens_to_generate: int = 100, temperature: float = 0.7, grammar_file_string: str = None):
     logging.info(f"Starting text completion using model: '{llm_model_name}' for input prompt: '{input_prompt}'")
@@ -1256,7 +1235,6 @@ async def generate_completion_from_local_llm(llm_model_name: str, input_prompt: 
                     temperature=temperature,
                 )
                 results.append(output['choices'][0]['text'])
-                logging.info(f"Chunk processed. Output tokens: {output['usage']['completion_tokens']:,}")
             except Exception as e:
                 logging.error(f"An error occurred while processing a chunk: {e}")
         return " ".join(results)
@@ -1295,10 +1273,9 @@ async def generate_completion_from_local_llm(llm_model_name: str, input_prompt: 
             "llm_model_usage_json": llm_model_usage_json
         }
 
-def calculate_safe_max_tokens(input_length: int, model_max_tokens: int, token_buffer: int = 500) -> int:
+def calculate_safe_max_tokens(input_length: int, model_max_tokens: int = 128000, token_buffer: int = 1000) -> int:
     available_tokens = max(0, model_max_tokens - input_length - token_buffer)
-    safe_max = min(available_tokens, model_max_tokens // 2, 4096)  # Ensure we don't exceed OpenAI's max limit
-    return max(1, safe_max)  # Ensure we always return at least 1 token
+    return min(available_tokens, 16384)  # Cap at max output tokens
 
 def calculate_importance_score(importance_analysis: str) -> dict:
     # Extract sub-scores and justifications
@@ -1335,15 +1312,36 @@ def calculate_importance_score(importance_analysis: str) -> dict:
 async def process_chunk_multi_stage(chunk, chunk_index, total_chunks, discovery_params):
     api_calls = 0
     total_tokens = 0
+    model_name = OPENAI_COMPLETION_MODEL if API_PROVIDER == "OPENAI" else CLAUDE_MODEL_STRING
+
     async def call_api(prompt, max_tokens):
         nonlocal api_calls, total_tokens
         api_calls += 1
         response = await generate_completion(prompt, max_tokens)
-        total_tokens += estimate_tokens(prompt, OPENAI_COMPLETION_MODEL) + estimate_tokens(response, OPENAI_COMPLETION_MODEL)
+        total_tokens += estimate_tokens(prompt, model_name) + estimate_tokens(response, model_name)
         return response
+
     try:
+        # Pre-calculate token counts for prompt templates
+        doc_id_prompt_tokens = estimate_tokens(doc_id_prompt, model_name)
+        relevance_check_prompt_tokens = estimate_tokens(relevance_check_prompt, model_name)
+        extract_gen_prompt_tokens = estimate_tokens(extract_gen_prompt, model_name)
+        tag_gen_prompt_tokens = estimate_tokens(tag_gen_prompt, model_name)
+        explanation_gen_prompt_tokens = estimate_tokens(explanation_gen_prompt, model_name)
+        importance_score_prompt_tokens = estimate_tokens(importance_score_prompt, model_name)
+
+        # Calculate available tokens for each stage
+        available_tokens = OPENAI_MAX_TOKENS - TOKEN_BUFFER
+        doc_id_tokens = min(500, available_tokens - doc_id_prompt_tokens)
+        relevance_tokens = min(500, available_tokens - relevance_check_prompt_tokens)
+        extract_tokens = min(1000, available_tokens - extract_gen_prompt_tokens)
+        tag_tokens = min(500, available_tokens - tag_gen_prompt_tokens)
+        explanation_tokens = min(1000, available_tokens - explanation_gen_prompt_tokens)
+        importance_tokens = min(1000, available_tokens - importance_score_prompt_tokens)
+
         # Stage 1: Document Identification
-        doc_info = await call_api(doc_id_prompt.format(document_excerpt=chunk, entities_of_interest=discovery_params['entities_of_interest']), 500)
+        doc_info = await call_api(doc_id_prompt.format(document_excerpt=chunk, entities_of_interest=discovery_params['entities_of_interest']), doc_id_tokens)
+
         # Stage 2: Relevance Check
         relevance_analysis = await call_api(relevance_check_prompt.format(
             discovery_goals=discovery_params['discovery_goals'],
@@ -1351,9 +1349,11 @@ async def process_chunk_multi_stage(chunk, chunk_index, total_chunks, discovery_
             document_excerpt=chunk,
             keywords=discovery_params['keywords'],
             entities_of_interest=discovery_params['entities_of_interest']
-        ), 500)
+        ), relevance_tokens)
+
         if 'RELEVANT: No' in relevance_analysis:
             return None, api_calls, total_tokens
+
         # Parallel processing stages
         extract_task = asyncio.create_task(call_api(extract_gen_prompt.format(
             relevance_analysis=relevance_analysis,
@@ -1361,15 +1361,18 @@ async def process_chunk_multi_stage(chunk, chunk_index, total_chunks, discovery_
             discovery_goals=discovery_params['discovery_goals'],
             keywords=discovery_params['keywords'],
             entities_of_interest=discovery_params['entities_of_interest']
-        ), 1000))
+        ), extract_tokens))
+
         tag_task = asyncio.create_task(call_api(tag_gen_prompt.format(
             doc_info=doc_info,
             relevance_analysis=relevance_analysis,
             discovery_goals=discovery_params['discovery_goals'],
             keywords=discovery_params['keywords'],
             entities_of_interest=discovery_params['entities_of_interest']
-        ), 500))
+        ), tag_tokens))
+
         key_extracts, tags = await asyncio.gather(extract_task, tag_task)
+
         # Sequential stages
         explanation = await call_api(explanation_gen_prompt.format(
             discovery_goals=discovery_params['discovery_goals'],
@@ -1378,7 +1381,8 @@ async def process_chunk_multi_stage(chunk, chunk_index, total_chunks, discovery_
             relevance_analysis=relevance_analysis,
             keywords=discovery_params['keywords'],
             entities_of_interest=discovery_params['entities_of_interest']
-        ), 1000)
+        ), explanation_tokens)
+
         importance_analysis = await call_api(importance_score_prompt.format(
             doc_info=doc_info,
             relevance_analysis=relevance_analysis,
@@ -1388,28 +1392,26 @@ async def process_chunk_multi_stage(chunk, chunk_index, total_chunks, discovery_
             discovery_goals=discovery_params['discovery_goals'],
             keywords_found=discovery_params['keywords'],
             entities_mentioned=discovery_params['entities_of_interest']
-        ), 1000)
+        ), importance_tokens)
+
         importance_score = calculate_importance_score(importance_analysis)
-        dossier_section = await call_api(dossier_section_prompt.format(
-            doc_info=doc_info,
-            relevance_analysis=relevance_analysis,
-            key_extracts=key_extracts,
-            tags=tags,
-            explanation=explanation,
-            importance_score=json.dumps(importance_score, indent=2),
-            discovery_goals=discovery_params['discovery_goals'],
-            keywords_found=discovery_params['keywords'],
-            entities_mentioned=discovery_params['entities_of_interest']
-        ), 2000)
-        return {
+
+        chunk_package = {
+            "chunk_index": chunk_index,
+            "total_chunks": total_chunks,
             "doc_info": doc_info,
             "relevance": relevance_analysis,
             "key_extracts": key_extracts,
             "tags": tags,
             "explanation": explanation,
             "importance_score": importance_score,
-            "dossier_section": dossier_section
-        }, api_calls, total_tokens
+            "api_calls": api_calls,
+            "total_tokens": total_tokens,
+            "chunk_text": chunk
+        }
+
+        return chunk_package, api_calls, total_tokens
+
     except Exception as e:
         logging.error(f"Error processing chunk {chunk_index}/{total_chunks}: {str(e)}")
         return None, api_calls, total_tokens
@@ -1590,25 +1592,33 @@ def format_importance_breakdown(sub_scores: Dict[str, Dict[str, Any]], overall_i
     breakdown += f"\nThe overall importance score of {overall_importance:.2f} is a weighted average of these sub-scores."
     return breakdown
 
-def chunk_document(document_text: str, chunk_size: int = 2000, overlap: int = 200) -> List[str]:
-    """
-    Split the document text into overlapping chunks.
-    """
+def chunk_document(document_text: str, model_name: str, max_chunk_tokens: int = 2000, overlap: int = 200) -> List[str]:
+    tokenizer = get_tokenizer(model_name)
     chunks = []
-    start = 0
-    text_length = len(document_text)
-    while start < text_length:
-        end = start + chunk_size
-        # If this is not the last chunk, try to break at a sentence boundary
-        if end < text_length:
-            # Look for the last sentence boundary within the overlap region
-            last_period = document_text.rfind('.', end - overlap, end)
-            if last_period != -1:
-                end = last_period + 1  # Include the period in this chunk
-        chunk = document_text[start:end].strip()
-        chunks.append(chunk)
-        # Move the start point, ensuring there's overlap
-        start = max(start + chunk_size - overlap, end - overlap)
+    sentences = re.split(r'(?<=[.!?])\s+', document_text)
+    current_chunk = []
+    current_chunk_tokens = 0
+    for sentence in sentences:
+        sentence_tokens = len(tokenizer.encode(sentence))
+        if current_chunk_tokens + sentence_tokens > max_chunk_tokens:
+            if current_chunk:
+                chunks.append(' '.join(current_chunk))
+                # Create overlap
+                overlap_tokens = 0
+                while overlap_tokens < overlap and current_chunk:
+                    overlap_tokens += len(tokenizer.encode(current_chunk[-1]))
+                    current_chunk = current_chunk[-1:]
+                current_chunk_tokens = overlap_tokens
+            else:
+                # If a single sentence exceeds max_chunk_tokens, we need to split it
+                chunks.append(sentence[:max_chunk_tokens])
+                current_chunk = []
+                current_chunk_tokens = 0
+                continue
+        current_chunk.append(sentence)
+        current_chunk_tokens += sentence_tokens
+    if current_chunk:
+        chunks.append(' '.join(current_chunk))
     return chunks
 
 async def process_document_for_discovery(file_path: str, discovery_params: Dict[str, Any], semaphore: asyncio.Semaphore, temp_folder: str) -> Dict[str, Any]:
@@ -1979,21 +1989,6 @@ def process_android_messages(file_path: str) -> str:
 
 async def beautify_and_format_as_markdown(text: str) -> str:
     logging.info(f"Beautifying and formatting text as markdown (length: {len(text):,} characters); first 100 characters of source text: {text[:100]}")
-    async def process_text(text: str, prompt_template: str, max_chunk_size: int = 2000) -> str:
-        text = escape_special_characters(text)
-        model_name = OPENAI_COMPLETION_MODEL if API_PROVIDER == "OPENAI" else CLAUDE_MODEL_STRING
-        if estimate_tokens(text, model_name) <= max_chunk_size:
-            prompt = prompt_template.format(text=text)
-            max_tokens = min(2048, 4096 - estimate_tokens(prompt, model_name))
-            return await generate_completion(prompt, max_tokens=max_tokens)
-        parts = []
-        chunks = chunk_text(text, max_chunk_size, model_name)
-        for chunk in chunks:
-            prompt = prompt_template.format(text=chunk)
-            max_tokens = min(2048, 4096 - estimate_tokens(prompt, model_name))
-            processed_part = await generate_completion(prompt, max_tokens=max_tokens)
-            parts.append(processed_part)
-        return "\n\n".join(parts)
     # Markdown formatting template
     markdown_template = """IMPORTANT: You are formatting a document for legal discovery. The integrity and accuracy of the original content are PARAMOUNT. Your task is ONLY to improve the formatting and readability using markdown, WITHOUT altering the original content in any way.
 
@@ -2044,12 +2039,27 @@ Text to refine:
 
 Refined markdown (START DIRECTLY WITH THE CONTENT, NO PREAMBLE):
 """
-    markdown_formatted = await process_text(text, markdown_template)
-    refined_markdown = await process_text(markdown_formatted, filtering_template)
+    # Process the text with markdown formatting
+    markdown_formatted = await process_text_with_llm(text, markdown_template, max_chunk_size=2000)
+    # Apply final filtering
+    refined_markdown = await process_text_with_llm(markdown_formatted, filtering_template, max_chunk_size=2000)
     logging.info(f"Text beautified and formatted as markdown. Output length: {len(refined_markdown):,} characters")
     return refined_markdown
 
-async def preprocess_document(file_path: str) -> Tuple[str, str, Dict[str, Any], bool]:
+async def preprocess_document(file_path: str, converted_source_dir: str) -> Tuple[str, str, Dict[str, Any], bool]:
+    # Check if converted file already exists
+    base_name = os.path.splitext(os.path.basename(file_path))[0]
+    txt_file_path = os.path.join(converted_source_dir, f"{base_name}.txt")
+    md_file_path = os.path.join(converted_source_dir, f"{base_name}.md")
+    if os.path.exists(txt_file_path) and os.path.getsize(txt_file_path) > 1024:
+        logging.info(f"Using existing converted file: {txt_file_path}")
+        with open(txt_file_path, 'r', encoding='utf-8') as file:
+            return file.read(), 'text/plain', {}, False
+    elif os.path.exists(md_file_path) and os.path.getsize(md_file_path) > 1024:
+        logging.info(f"Using existing converted file: {md_file_path}")
+        with open(md_file_path, 'r', encoding='utf-8') as file:
+            return file.read(), 'text/markdown', {}, True
+    # If no existing converted file, proceed with conversion
     with open(file_path, 'rb') as file:
         file_content = file.read()
         result = magika.identify_bytes(file_content)
@@ -2103,9 +2113,14 @@ async def preprocess_document(file_path: str) -> Tuple[str, str, Dict[str, Any],
     extracted_text = remove_pagination_breaks(extracted_text)
     sentences = sophisticated_sentence_splitter(extracted_text)
     processed_text = "\n".join(sentences)
-    # Apply beautification and markdown formatting for non-OCR processed documents (since these already have markdown formatting)
+    # Apply beautification and markdown formatting for non-OCR processed documents
     if not used_smart_ocr and not already_in_markdown:
         processed_text = await beautify_and_format_as_markdown(processed_text)
+    # Save the processed text
+    output_file_path = md_file_path if used_smart_ocr or already_in_markdown else txt_file_path
+    with open(output_file_path, 'w', encoding='utf-8') as f:
+        f.write(processed_text)
+    logging.info(f"Saved processed text to {output_file_path}")
     return processed_text, detected_mime_type, metadata, used_smart_ocr
 
 async def convert_documents_to_plaintext(original_source_dir: str, converted_source_dir: str, files_to_convert: List[str]):
@@ -2135,7 +2150,7 @@ async def convert_documents_to_plaintext(original_source_dir: str, converted_sou
                     os.remove(existing_file)
             try:
                 pbar.set_postfix_str(f"Processing {os.path.basename(file_path)}")
-                processed_text, mime_type, metadata, used_smart_ocr = await preprocess_document(file_path)
+                processed_text, mime_type, metadata, used_smart_ocr = await preprocess_document(file_path, converted_source_dir)
                 if not processed_text.strip():
                     pbar.set_postfix_str(f"No text extracted from {os.path.basename(file_path)}")
                     pbar.update(1)
@@ -2228,12 +2243,10 @@ USABILITY_SCORE: [0-100, where 0 is completely unusable and 100 is perfect]
             if validate_corruption_analysis_result(analysis):
                 is_corrupted = analysis['CORRUPTED'].lower() == 'yes'
                 usability_score = int(analysis['USABILITY_SCORE'])
-                
                 # Additional safeguard: only consider it corrupted if usability is very low
                 if is_corrupted and usability_score > 20:
                     is_corrupted = False
                     analysis['EXPLANATION'] += " However, the usability score suggests the content may still be valuable."
-
                 return {
                     'input_file': original_file_path,
                     'output_file': file_path,
@@ -2364,39 +2377,7 @@ async def process_difficult_pdf_with_gpt4_vision(file_path: str) -> str:
     return "\n\n--- New Page ---\n\n".join(all_text)
 
 async def process_gpt4_vision_result(text: str) -> str:
-    # Similar to process_chunk_ocr, but adapted for GPT-4 Vision results
     logging.info(f"Processing GPT-4 Vision result (length: {len(text):,} characters)")
-    async def process_text(text: str, prompt_template: str, max_chunk_size: int = 1000) -> str:
-        text = escape_special_characters(text)
-        model_name = OPENAI_COMPLETION_MODEL if API_PROVIDER == "OPENAI" else CLAUDE_MODEL_STRING
-        if estimate_tokens(text, model_name) <= max_chunk_size:
-            prompt = prompt_template.format(text=text)
-            max_tokens = min(2048, 4096 - estimate_tokens(prompt, model_name))
-            return await generate_completion(prompt, max_tokens=max_tokens)
-        parts = []
-        words = text.split()
-        current_part = []
-        current_tokens = 0
-        for word in words:
-            word_tokens = estimate_tokens(word, model_name)
-            if current_tokens + word_tokens > max_chunk_size:
-                part_text = " ".join(current_part)
-                prompt = prompt_template.format(text=part_text)
-                max_tokens = min(2048, 4096 - estimate_tokens(prompt, model_name))
-                processed_part = await generate_completion(prompt, max_tokens=max_tokens)
-                parts.append(processed_part)
-                current_part = [word]
-                current_tokens = word_tokens
-            else:
-                current_part.append(word)
-                current_tokens += word_tokens
-        if current_part:
-            part_text = " ".join(current_part)
-            prompt = prompt_template.format(text=part_text)
-            max_tokens = min(2048, 4096 - estimate_tokens(prompt, model_name))
-            processed_part = await generate_completion(prompt, max_tokens=max_tokens)
-            parts.append(processed_part)
-        return " ".join(parts)
     # Error correction template
     error_correction_template = """Review and correct any errors in the following text extracted from a document using GPT-4 Vision. Follow these guidelines:
 
@@ -2413,7 +2394,7 @@ Text to process:
 
 Corrected text:
 """
-    corrected_text = await process_text(text, error_correction_template)
+
     # Markdown formatting template
     markdown_template = """Reformat the following text as markdown, improving readability while preserving the original structure. Follow these guidelines:
 1. Convert headings to appropriate markdown heading levels (# for main titles, ## for subtitles, etc.)
@@ -2433,7 +2414,6 @@ Text to reformat:
 
 Reformatted markdown:
 """
-    markdown_formatted = await process_text(corrected_text, markdown_template)
     # Final filtering template
     filtering_template = """Review the following markdown-formatted text and remove any invalid or unwanted elements without altering the actual content. Follow these guidelines:
 
@@ -2452,8 +2432,16 @@ Text to filter:
 
 Filtered text:
 """
-    filtered_text = await process_text(markdown_formatted, filtering_template)
-    logging.info(f"GPT-4 Vision result processed. Output length: {len(filtered_text):,} characters")
+    # Step 1: Error correction
+    corrected_text = await process_text_with_llm(text, error_correction_template, max_chunk_size=1000)
+    logging.info(f"Error correction completed. Output length: {len(corrected_text):,} characters")
+    # Step 2: Markdown formatting
+    markdown_formatted = await process_text_with_llm(corrected_text, markdown_template, max_chunk_size=1000)
+    logging.info(f"Markdown formatting completed. Output length: {len(markdown_formatted):,} characters")
+    # Step 3: Final filtering
+    filtered_text = await process_text_with_llm(markdown_formatted, filtering_template, max_chunk_size=1000)
+    logging.info(f"Final filtering completed. Output length: {len(filtered_text):,} characters")
+    logging.info(f"GPT-4 Vision result processed. Final output length: {len(filtered_text):,} characters")
     return filtered_text
 
 async def process_corrupted_files_with_gpt4_vision(corrupted_files_path: str):
@@ -2482,7 +2470,6 @@ def create_and_populate_case_sqlite_database(config_file_path, converted_source_
     conn = sqlite3.connect(db_file_path)
     cursor = conn.cursor()
     logging.info(f"Created SQLite database at: {db_file_path}")
-
     # Create tables
     tables = [
         ("case_metadata", '''CREATE TABLE IF NOT EXISTS case_metadata (
@@ -2519,22 +2506,18 @@ def create_and_populate_case_sqlite_database(config_file_path, converted_source_
             id INTEGER PRIMARY KEY, document_id INTEGER, output_type TEXT,
             output_content TEXT, FOREIGN KEY (document_id) REFERENCES documents (id))''')
     ]
-
     for table_name, create_table_sql in tables:
         cursor.execute(create_table_sql)
         logging.info(f"Created table: {table_name}")
-
     # Insert case metadata
     with open(config_file_path, 'r') as config_file:
         config_data = json.load(config_file)
-
     cursor.execute('''INSERT INTO case_metadata 
         (config_file_path, freeform_input_text, json_config, case_name, creation_date)
         VALUES (?, ?, ?, ?, ?)''', 
         (config_file_path, USER_FREEFORM_TEXT_GOAL_INPUT, json.dumps(config_data), 
-         config_data['case_name'], datetime.now().isoformat()))
+            config_data['case_name'], datetime.now().isoformat()))
     logging.info("Inserted case metadata")
-
     # Insert discovery goals, keywords, and entities
     for goal in tqdm(config_data['discovery_goals'], desc="Inserting discovery goals and keywords"):
         cursor.execute('INSERT INTO discovery_goals (description, importance) VALUES (?, ?)',
@@ -2547,7 +2530,6 @@ def create_and_populate_case_sqlite_database(config_file_path, converted_source_
     for entity in tqdm(config_data['entities_of_interest'], desc="Inserting entities of interest"):
         cursor.execute('INSERT OR IGNORE INTO entities_of_interest (entity_name) VALUES (?)',
                         (entity,))
-
     def insert_document(file_path, is_original):
         with open(file_path, 'rb') as file:
             file_content = file.read()
@@ -2601,7 +2583,6 @@ def create_and_populate_case_sqlite_database(config_file_path, converted_source_
             creation_date, last_modified_date, is_email, email_from, email_to,
             email_subject, email_date, ocr_applied, 0, 0))
         return cursor.lastrowid, file_hash
-
     # Process original documents
     original_docs = {}
     original_files = [os.path.join(root, file) for root, _, files in os.walk(original_source_dir) for file in files]
@@ -2752,42 +2733,154 @@ def save_processing_info(
     processed_file_path = os.path.join(processed_files_dir, f"{base_name}.json")
     with open(processed_file_path, 'w') as f:
         json.dump(processing_info, f, indent=2)
-    
-async def process_document_wrapper(file_path: str, discovery_params: Dict[str, Any], discovery_output_dir: str, semaphore: asyncio.Semaphore):
+
+async def process_document_async(file_path: str, converted_source_dir: str, discovery_params: Dict[str, Any], discovery_output_dir: str, semaphore: asyncio.Semaphore, model_name: str, max_chunk_tokens: int):
+    logging.info(f"Processing file: {file_path}")
+    start_time = time.time()
+    total_api_calls = 0
+    total_tokens_used = 0
+    with open(file_path, 'rb') as file:
+        file_content = file.read()
+        result = magika.identify_bytes(file_content)
+        detected_mime_type = result.output.mime_type
+    document_id = hashlib.sha256(file_content).hexdigest()
+    json_output_path = os.path.join(discovery_output_dir, f"{document_id}_results.json")
+    result = {
+        'document_id': document_id,
+        'file_path': file_path,
+        'processed_chunks': [],
+        'low_importance_chunks': [],
+        'metadata': {
+            'file_path': file_path,
+            'mime_type': detected_mime_type,
+            'file_size_bytes': os.path.getsize(file_path)
+        }
+    }
+    # Save initial result
+    with open(json_output_path, 'w') as f:
+        json.dump(result, f, indent=2)
     try:
-        async with semaphore:
-            # Check if the file has already been processed
-            processed_file_path = os.path.join(discovery_output_dir, 'processed_files', f"{os.path.basename(file_path)}.json")
-            if os.path.exists(processed_file_path):
-                logging.info(f"Skipping already processed file: {os.path.basename(file_path)}")
-                return None
-            result = await process_document_for_discovery(file_path, discovery_params, semaphore, discovery_output_dir)
-            if result:
-                processing_info = {
-                    "completion_datetime": datetime.now().isoformat(),
-                    "processing_time_seconds": result['processing_time_seconds'],
-                    "llm_api_calls": result['total_api_calls'],
-                    "total_tokens_used": result['total_tokens_used'],
-                    "high_priority_dossier_length": len(result.get('dossier_section', '')),
-                    "low_priority_dossier_length": len(result.get('low_importance_section', '')),
-                }
-                save_processing_info(discovery_output_dir, os.path.basename(file_path), processing_info)
-                logging.info(f"Processed {os.path.basename(file_path)}")
-                return result
+        processed_text, _, metadata, _ = await preprocess_document(file_path, converted_source_dir)
+        sentences = sophisticated_sentence_splitter(processed_text)
+        result['metadata']['total_sentences'] = len(sentences)
+        result['metadata']['thousands_of_input_words'] = round(sum(len(s.split()) for s in sentences) / 1000, 2)
+        if metadata:
+            result['metadata'].update(metadata)
+        # Update result file with metadata
+        with open(json_output_path, 'w') as f:
+            json.dump(result, f, indent=2)
+        chunk_size = 10
+        chunks = [sentences[i:i + chunk_size] for i in range(0, len(sentences), chunk_size)]
+        async def process_chunk(chunk, i):
+            async with semaphore:
+                chunk_text = " ".join(chunk)
+                chunk_result, api_calls, tokens_used = await process_chunk_multi_stage(chunk_text, i, len(chunks), discovery_params)
+                if chunk_result:
+                    importance_score = float(chunk_result['importance_score']['final_score'])
+                    if importance_score >= discovery_params['minimum_importance_score']:
+                        result['processed_chunks'].append(chunk_result)
+                    else:
+                        result['low_importance_chunks'].append(chunk_result)
+                    logging.info(f"Processed chunk {i+1}/{len(chunks)} for document {file_path}; importance score: {importance_score:.2f}; total chunks processed: {len(result['processed_chunks'])}")
+                    # Update result file after each chunk
+                    with open(json_output_path, 'w') as f:
+                        json.dump(result, f, indent=2)
+                return chunk_result, api_calls, tokens_used
+        with ThreadPoolExecutor() as executor:
+            loop = asyncio.get_event_loop()
+            chunk_results = await asyncio.gather(*[loop.run_in_executor(executor, lambda: asyncio.run(process_chunk(chunk, i))) for i, chunk in enumerate(chunks)])
+        for chunk_result, api_calls, tokens_used in chunk_results:
+            if chunk_result:
+                total_api_calls += api_calls
+                total_tokens_used += tokens_used
+        if not result['processed_chunks'] and not result['low_importance_chunks']:
+            logging.info(f"Document {file_path} did not yield any relevant information.")
+            return None
+        dossier_section = compile_dossier_section(result['processed_chunks'], document_id, file_path, discovery_params)
+        low_importance_section = compile_dossier_section(result['low_importance_chunks'], document_id, file_path, discovery_params)
+        result['dossier_section'] = dossier_section['dossier_section'] if dossier_section else None
+        result['importance_score'] = dossier_section['importance_score'] if dossier_section else 0
+        result['low_importance_section'] = low_importance_section['dossier_section'] if low_importance_section else None
+        end_time = time.time()
+        result['processing_time_seconds'] = end_time - start_time
+        result['total_api_calls'] = total_api_calls
+        result['total_tokens_used'] = total_tokens_used
+        # Save final result
+        with open(json_output_path, 'w') as f:
+            json.dump(result, f, indent=2)
+        # Generate document-level dossier
+        dossier_file_name = f"document_level_dossier__{os.path.splitext(os.path.basename(file_path))[0]}.md"
+        dossier_file_path = os.path.join(discovery_output_dir, dossier_file_name)
+        with open(dossier_file_path, 'w', encoding='utf-8') as f:
+            if result['dossier_section']:
+                f.write(result['dossier_section'])
+            if result['low_importance_section']:
+                f.write("\n\n## Low Importance Section\n\n")
+                f.write(result['low_importance_section'])
+        logging.info(f"Processed {file_path} in {result['processing_time_seconds']:.2f} seconds. "
+                        f"API calls: {total_api_calls}, Tokens used: {total_tokens_used}, "
+                        f"Importance score: {result['importance_score']:.2f}")
+        return result
     except Exception as e:
         logging.error(f"Error processing {os.path.basename(file_path)}: {str(e)}")
-    return None
+        logging.debug(f"Full traceback for {os.path.basename(file_path)}:", exc_info=True)
+        return None
 
-def process_document_wrapper_mp(file_path, discovery_params, discovery_output_dir, semaphore):
+def compile_results(file_path: str, discovery_params: Dict[str, Any]) -> Dict[str, Any]:
+    json_output_path = file_path.replace('.txt', '_discovery_results.json').replace('.md', '_discovery_results.json')
+    if not os.path.exists(json_output_path):
+        logging.error(f"Results file not found for {file_path}")
+        return None
+    with open(json_output_path, 'r') as f:
+        document_results = json.load(f)
+    compiled_result = {
+        'file_path': file_path,
+        'document_id': hashlib.sha256(file_path.encode()).hexdigest(),
+        'dossier_section': '',
+        'low_importance_section': '',
+        'importance_score': 0,
+        'processed_chunks': document_results['processed_chunks'],
+        'metadata': {
+            'file_path': file_path,
+            'total_chunks': document_results['total_chunks'],
+            'total_api_calls': document_results['total_api_calls'],
+            'total_tokens_used': document_results['total_tokens_used'],
+            'processing_time_seconds': document_results.get('processing_time_seconds', 0)
+        }
+    }
+    # Combine dossier sections and calculate overall importance score
+    high_importance_chunks = []
+    low_importance_chunks = []
+    for chunk_result in document_results['processed_chunks']:
+        if chunk_result['importance_score']['final_score'] >= discovery_params['minimum_importance_score']:
+            high_importance_chunks.append(chunk_result)
+        else:
+            low_importance_chunks.append(chunk_result)
+    compiled_result['importance_score'] = sum(chunk['importance_score']['final_score'] for chunk in document_results['processed_chunks']) / len(document_results['processed_chunks'])
+    if high_importance_chunks:
+        compiled_result['dossier_section'] = compile_dossier_section(high_importance_chunks, compiled_result['document_id'], file_path, discovery_params)
+    if low_importance_chunks:
+        compiled_result['low_importance_section'] = compile_dossier_section(low_importance_chunks, compiled_result['document_id'], file_path, discovery_params)
+    # Save document-level dossier
+    dossier_file_name = f"document_level_dossier__{os.path.splitext(os.path.basename(file_path))[0]}.md"
+    dossier_file_path = os.path.join(os.path.dirname(json_output_path), dossier_file_name)
+    with open(dossier_file_path, 'w', encoding='utf-8') as f:
+        f.write(compiled_result['dossier_section'])
+        if compiled_result['low_importance_section']:
+            f.write("\n\n## Low Importance Section\n\n")
+            f.write(compiled_result['low_importance_section'])
+    return compiled_result
+
+def process_document_wrapper_mp(file_path, converted_source_dir, discovery_params, discovery_output_dir, semaphore, model_name, max_chunk_tokens):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        result = loop.run_until_complete(process_document_wrapper(file_path, discovery_params, discovery_output_dir, semaphore))
+        result = loop.run_until_complete(process_document_async(file_path, converted_source_dir, discovery_params, discovery_output_dir, semaphore, model_name, max_chunk_tokens))
         return result
     finally:
         loop.close()
-        
-                        
+
+
 #############################################################################################################################    
     
 # Static configuration
@@ -2932,10 +3025,8 @@ async def main():
     
     # Determine which files need to be processed
     files_to_convert, files_to_discover = await determine_files_to_process(original_source_dir, converted_source_dir, discovery_output_dir)
-    logging.info(f"Files to convert: {len(files_to_convert)}")
-    logging.info(f"Files to discover: {len(files_to_discover)}")
 
-    use_skip_conversion = 1
+    use_skip_conversion = 0
     if use_skip_conversion:
         logging.info("Skipping conversion of source documents to plaintext...")
     else:
@@ -2944,7 +3035,7 @@ async def main():
         logging.info("Now processing MS Outlook PST files...")
         await process_pst_files(original_source_dir, converted_source_dir)
         logging.info("Now converting source documents to plaintext (and performing OCR if needed)...")
-        await convert_documents_to_plaintext(original_source_dir, converted_source_dir)
+        await convert_documents_to_plaintext(original_source_dir, converted_source_dir, files_to_convert)
     
     # Step 2b: Check for corrupted/failed output files
     logging.info("Now checking for corrupted or failed output files...")
@@ -2957,7 +3048,7 @@ async def main():
     total_size = sum(os.path.getsize(file_path) for file_path in list_of_corrupted_or_failed_files if os.path.exists(file_path))
     logging.info(f"Found {len(list_of_corrupted_or_failed_files)} corrupted or failed output files, with a total data size of {total_size / 1024 / 1024:.4f} MB")
         
-    use_delete_corrupted_or_failed_files = 1
+    use_delete_corrupted_or_failed_files = 0
     if use_delete_corrupted_or_failed_files:
         # Delete corrupted or failed output files
         logging.info(f"Deleting {len(list_of_corrupted_or_failed_files)} corrupted or failed output files...")
@@ -2992,6 +3083,16 @@ async def main():
     # Step 3: Process converted documents
     logging.info("\n________________________________________________________________________________\n\nNow performing automated legal discovery on converted documents!!")
 
+    model_name = OPENAI_COMPLETION_MODEL if API_PROVIDER == "OPENAI" else CLAUDE_MODEL_STRING
+    max_chunk_tokens = OPENAI_MAX_TOKENS - TOKEN_BUFFER - max(
+        estimate_tokens(doc_id_prompt, model_name),
+        estimate_tokens(relevance_check_prompt, model_name),
+        estimate_tokens(extract_gen_prompt, model_name),
+        estimate_tokens(tag_gen_prompt, model_name),
+        estimate_tokens(explanation_gen_prompt, model_name),
+        estimate_tokens(importance_score_prompt, model_name)
+    )
+
     # Use multiprocessing to distribute document processing with a progress bar
     total_files = len(files_to_discover)
     with multiprocessing.Pool(processes=multiprocessing.cpu_count()) as pool:
@@ -2999,9 +3100,12 @@ async def main():
             results = []
             for result in pool.imap_unordered(
                 partial(process_document_wrapper_mp, 
+                        converted_source_dir=converted_source_dir,
                         discovery_params=discovery_params, 
                         discovery_output_dir=discovery_output_dir,
-                        semaphore=semaphore), 
+                        semaphore=semaphore,
+                        model_name=model_name,
+                        max_chunk_tokens=max_chunk_tokens),
                 files_to_discover
             ):
                 if result is not None:
