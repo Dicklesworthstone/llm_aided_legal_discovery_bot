@@ -1,7 +1,5 @@
 # LLM-Aided Legal Discovery Automation
 
-## Table of Contents
-
 ## Introduction
 
 LLM-Aided Legal Discovery Automation is a powerful tool designed to streamline the legal discovery process by leveraging advanced AI models. It addresses the challenges legal professionals face when dealing with large volumes of documents in cases such as corporate litigation, intellectual property disputes, or regulatory investigations.
