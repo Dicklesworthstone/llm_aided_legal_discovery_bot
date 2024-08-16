@@ -28,6 +28,7 @@ import picologging as logging
 from decouple import Config as DecoupleConfig, RepositoryEnv
 from magika import Magika
 from tqdm import tqdm
+from tqdm.asyncio import tqdm as atqdm
 import httpx
 import backoff
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -133,6 +134,17 @@ async def parse_email_async(file_path: str) -> Dict[str, Any]:
         'body': body
     }
 
+def minimal_clean_email_body(body: str) -> str:
+    # Step 1: Normalize line breaks
+    body = body.replace('\r\n', '\n').replace('\r', '\n')
+    # Step 2: Remove any null bytes
+    body = body.replace('\x00', '')
+    # Step 3: Remove excessive blank lines (more than 3 in a row); This preserves intentional spacing while removing only extreme cases
+    body = re.sub(r'\n{4,}', '\n\n\n', body)
+    # Step 4: Ensure the email ends with a single newline
+    body = body.rstrip() + '\n'
+    return body
+
 async def parse_enron_email_async(file_path: str) -> Dict[str, Any]:
     async with aiofiles.open(file_path, 'rb') as file:
         content = await file.read()
@@ -174,32 +186,11 @@ async def parse_enron_email_async(file_path: str) -> Dict[str, Any]:
                 body += part.get_payload(decode=True).decode('utf-8', errors='ignore')
     else:
         body = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
-    body = re.sub(r'\s+', ' ', body).strip()
+    body = minimal_clean_email_body(body) # Apply the minimal cleanup function
     return {
         'headers': headers,
         'body': body
     }
-
-async def process_enron_maildir_async(maildir_path: str, max_concurrent: int = 100) -> List[Dict[str, Any]]:
-    semaphore = asyncio.Semaphore(max_concurrent)
-    emails = []
-    async def process_file(file_path: str):
-        async with semaphore:
-            try:
-                email_data = await parse_enron_email_async(file_path)
-                email_data['file_path'] = file_path
-                return email_data
-            except Exception as e:
-                print(f"Error processing {file_path}: {str(e)}")
-                return None
-    tasks = []
-    for root, _, files in os.walk(maildir_path):
-        for file in files:
-            file_path = os.path.join(root, file)
-            tasks.append(asyncio.create_task(process_file(file_path)))
-    results = await asyncio.gather(*tasks)
-    emails = [email for email in results if email is not None]  # noqa: F811
-    return emails
 
 async def parse_document_into_sentences(file_path: str, mime_type: str) -> Tuple[List[str], float, Dict[str, Any]]:
     content = ""
@@ -244,7 +235,6 @@ async def download_and_extract_enron_emails_dataset(url: str, destination_folder
         async with httpx.AsyncClient() as client:
             async with client.stream("GET", url) as response:
                 total_size = int(response.headers.get("Content-Length", 0))
-                
                 with open(zip_file_path, "wb") as file, tqdm(
                     desc="Downloading Enron dataset",
                     total=total_size,
@@ -283,55 +273,88 @@ async def download_and_extract_enron_emails_dataset(url: str, destination_folder
         logging.error("Failed to locate the final Maildir")
         return None
 
-async def process_extracted_enron_emails(maildir_path: str, converted_source_dir: str, turn_enron_email_archive_into_individual_converted_markdown_files_per_sender: bool):
+async def process_extracted_enron_emails(maildir_path: str, converted_source_dir: str):
     logging.info(f"Now processing extracted Enron email corpus from {maildir_path}")
-    enron_emails = await process_enron_maildir_async(maildir_path)
-    if turn_enron_email_archive_into_individual_converted_markdown_files_per_sender:
-        sender_emails = {}
-        for email_data in enron_emails:
-            sender = email_data['headers']['From']['email']
-            if sender not in sender_emails:
-                sender_emails[sender] = []
-            sender_emails[sender].append(email_data)
-        async def write_sender_file(sender: str, emails: List[Dict[str, Any]]):
+    semaphore = asyncio.Semaphore(25000)
+    async def process_subfolder(sender: str, subfolder: str, subfolder_path: str, pbar: tqdm):
+        emails = []
+        async def process_file(file_path: str):
+            async with semaphore:
+                try:
+                    email_data = await parse_enron_email_async(file_path)
+                    email_data['file_path'] = file_path
+                    # Create unique per-email identifier
+                    headers_str = json.dumps(email_data['headers'], sort_keys=True)
+                    content_for_hash = headers_str + email_data['body']
+                    email_unique_identifier = hashlib.sha256(content_for_hash.encode()).hexdigest()[:16]
+                    email_data['unique_identifier'] = email_unique_identifier
+                    emails.append(email_data)
+                    pbar.set_postfix_str(f"Processed: {os.path.basename(file_path)}", refresh=False)
+                    pbar.update(1)
+                except Exception as e:
+                    pbar.set_postfix_str(f"Error: {os.path.basename(file_path)}", refresh=False)
+                    pbar.update(1)
+                    logging.error(f"Error processing {file_path}: {str(e)}")
+        tasks = []
+        for file in os.listdir(subfolder_path):
+            file_path = os.path.join(subfolder_path, file)
+            if os.path.isfile(file_path):
+                tasks.append(asyncio.create_task(process_file(file_path)))
+        await asyncio.gather(*tasks)
+        return emails
+    async def write_bundle_file(sender: str, subfolder: str, emails: List[Dict[str, Any]]):
+        async with semaphore:
             markdown_content = ""
-            for email_data in emails:
-                markdown_content += f"From: {email_data['headers']['From']['name']} <{email_data['headers']['From']['email']}>\n"
-                markdown_content += f"To: {', '.join([f'{r['name']} <{r['email']}>' for r in email_data['headers']['To']])}\n"
-                markdown_content += f"Subject: {email_data['headers']['Subject']}\n"
-                markdown_content += f"Date: {email_data['headers']['Date']}\n\n"
-                markdown_content += email_data['body']
-                markdown_content += "\n\n---\n\n"
-            safe_sender = ''.join(c if c.isalnum() else '_' for c in sender)
-            markdown_file_path = os.path.join(converted_source_dir, f"{safe_sender}_emails.md")
+            for index, email_data in enumerate(emails, 1):
+                markdown_content += f"# Email {index} of {len(emails)} from {sender} in {subfolder}\n\n"
+                markdown_content += f"**Unique Email Identifier:** {email_data['unique_identifier']}\n"
+                markdown_content += f"**From:** {email_data['headers']['From']['name']} <{email_data['headers']['From']['email']}>\n"
+                markdown_content += f"**To:** {', '.join([f'{r['name']} <{r['email']}>' for r in email_data['headers']['To']])}\n"
+                markdown_content += f"**Subject:** {email_data['headers']['Subject']}\n"
+                markdown_content += f"**Date:** {email_data['headers']['Date']}\n"
+                if email_data['headers']['Cc']:
+                    markdown_content += f"**Cc:** {', '.join([f'{r['name']} <{r['email']}>' for r in email_data['headers']['Cc']])}\n"
+                if email_data['headers']['Bcc']:
+                    markdown_content += f"**Bcc:** {', '.join([f'{r['name']} <{r['email']}>' for r in email_data['headers']['Bcc']])}\n"
+                markdown_content += f"**X-Folder:** {email_data['headers']['X-Folder']}\n"
+                markdown_content += f"**X-Origin:** {email_data['headers']['X-Origin']}\n"
+                markdown_content += f"**X-FileName:** {email_data['headers']['X-FileName']}\n\n"
+                markdown_content += f"**Body:**\n\n{email_data['body']}\n\n"
+                markdown_content += "---\n\n"
+            safe_sender = ''.join(c.lower() if c.isalnum() else '_' for c in sender)
+            safe_subfolder = ''.join(c.lower() if c.isalnum() else '_' for c in subfolder)
+            markdown_file_name = f"email_bundle__sender__{safe_sender}__category__{safe_subfolder}.md"
+            markdown_file_path = os.path.join(converted_source_dir, markdown_file_name)
+            os.makedirs(converted_source_dir, exist_ok=True)
             async with aiofiles.open(markdown_file_path, 'w', encoding='utf-8') as f:
                 await f.write(markdown_content)
-            logging.info(f"Created markdown file for sender: {sender}")
-        tasks = [write_sender_file(sender, emails) for sender, emails in sender_emails.items()]
-        await asyncio.gather(*tasks)
-    else:
-        async def write_email_file(email_data: Dict[str, Any]):
-            file_path = email_data['file_path']
-            content = f"From: {email_data['headers']['From']['name']} <{email_data['headers']['From']['email']}>\n"
-            content += f"To: {', '.join([f'{r['name']} <{r['email']}>' for r in email_data['headers']['To']])}\n"
-            content += f"Subject: {email_data['headers']['Subject']}\n"
-            content += f"Date: {email_data['headers']['Date']}\n\n"
-            content += email_data['body']
-            base_name = os.path.relpath(file_path, maildir_path).replace('/', '_')
-            converted_file_path = os.path.join(converted_source_dir, f"{base_name}.txt")
-            os.makedirs(os.path.dirname(converted_file_path), exist_ok=True)
-            async with aiofiles.open(converted_file_path, 'w', encoding='utf-8') as f:
-                await f.write(content)
-            logging.info(f"Converted Enron email: {file_path}")
-        tasks = [write_email_file(email_data) for email_data in enron_emails]
-        await asyncio.gather(*tasks)
-    logging.info("Finished processing Enron email corpus")
-    
+            logging.info(f"Created markdown file: {markdown_file_name}")
+    # Get total number of files
+    total_files = sum([len(files) for _, _, files in os.walk(maildir_path)])
+    with tqdm(total=total_files, desc="Processing Enron emails", unit="email") as pbar:
+        for sender in os.listdir(maildir_path):
+            sender_path = os.path.join(maildir_path, sender)
+            if os.path.isdir(sender_path):
+                for subfolder in os.listdir(sender_path):
+                    subfolder_path = os.path.join(sender_path, subfolder)
+                    if os.path.isdir(subfolder_path):
+                        # Check if this bundle has already been processed
+                        safe_sender = ''.join(c.lower() if c.isalnum() else '_' for c in sender)
+                        safe_subfolder = ''.join(c.lower() if c.isalnum() else '_' for c in subfolder)
+                        output_file_name = f"email_bundle__sender__{safe_sender}__category__{safe_subfolder}.md"
+                        output_file_path = os.path.join(converted_source_dir, output_file_name)
+                        if os.path.exists(output_file_path):
+                            logging.info(f"Skipping already processed bundle: {output_file_name}")
+                            pbar.update(sum(1 for _ in os.listdir(subfolder_path) if os.path.isfile(os.path.join(subfolder_path, _))))
+                            continue
+                        emails = await process_subfolder(sender, subfolder, subfolder_path, pbar)
+                        await write_bundle_file(sender, subfolder, emails)
+    logging.info("Finished processing Enron email corpus.")
+
 async def process_enron_email_corpus(
     project_root: str,
     original_source_dir: str,
-    converted_source_dir: str,
-    turn_enron_email_archive_into_individual_converted_markdown_files_per_sender: bool = False
+    converted_source_dir: str
 ):
     logging.info("Processing Enron email corpus")
     enron_dataset_url = "https://tile.loc.gov/storage-services/master/gdc/gdcdatasets/2018487913/2018487913.zip"                
@@ -343,14 +366,14 @@ async def process_enron_email_corpus(
         subdirs = [d for d in os.listdir(maildir_path) if os.path.isdir(os.path.join(maildir_path, d))]
         if len(subdirs) == 150:
             logging.info("Enron email corpus already extracted and present. Skipping download and extraction.")
-            return await process_extracted_enron_emails(maildir_path, converted_source_dir, turn_enron_email_archive_into_individual_converted_markdown_files_per_sender)
+            return await process_extracted_enron_emails(maildir_path, converted_source_dir)
     # If we don't have the complete extracted data, proceed with download and extraction
     logging.info("Downloading and extracting Enron dataset...")
     maildir_path = await download_and_extract_enron_emails_dataset(enron_dataset_url, enron_dataset_dir)
     if not maildir_path or not os.path.exists(maildir_path):
         logging.error("Failed to download or extract Enron dataset. Skipping Enron email processing.")
         return
-    return await process_extracted_enron_emails(maildir_path, converted_source_dir, turn_enron_email_archive_into_individual_converted_markdown_files_per_sender)
+    return await process_extracted_enron_emails(maildir_path, converted_source_dir)
 
 
 ##########################################################################
@@ -2739,8 +2762,7 @@ async def main():
         await process_enron_email_corpus(
             project_root,
             original_source_dir,
-            converted_source_dir,
-            turn_enron_email_archive_into_individual_converted_markdown_files_per_sender=True  # or False
+            converted_source_dir
         )          
             
     # Step 2d: Create and populate a SQLite database for the discovery case containing converted documents and their metadata and other relevant information

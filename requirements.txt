@@ -1,4 +1,5 @@
 aiolimiter
+aiofiles
 anthropic
 backoff
 beautifulsoup4
