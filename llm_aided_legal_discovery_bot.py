@@ -684,7 +684,7 @@ Document excerpt:
 Entities of Interest:
 {entities_of_interest}
 
-Provide your analysis in the following format:
+Provide your analysis in the following format (if a field is not applicable, leave it blank; if it's not available, use "N/A"):
 TYPE: [Document Type]
 DATE: [Date of Creation]
 AUTHOR: [Author]
@@ -741,7 +741,7 @@ Keywords of Interest:
 Entities of Interest:
 {entities_of_interest}
 
-Generate up to 3 key extracts, using ellipses (...) to focus on the most relevant parts. Use markdown formatting (italic and bold) to emphasize the most important words or phrases, especially the keywords and entities of interest.
+Generate up to 3 key extracts, using ellipses (...) to focus on the most relevant parts. Use markdown formatting (italic and bold) to emphasize the most important words or phrases, especially the keywords and entities of interest, and in particular, how these pertain to the stated discovery goals.
 
 Provide your extracts in the following format:
 EXTRACT 1: [Extract with formatting]
@@ -756,7 +756,7 @@ RELEVANCE 3: [Brief explanation of how this extract relates to specific discover
 
 # Tag Generation
 tag_gen_prompt = """
-Based on the document information, relevance analysis, and key extracts, generate a set of tags that describe the content and its relevance to the discovery goals.
+Based on the document information, relevance analysis, and key extracts, generate a set of tags (like #hashtags, using the hashtag symbol and only lowercase letters and underscores) that describe the content and its relevance to the discovery goals.
 
 Document Information:
 {doc_info}
@@ -776,15 +776,15 @@ Keywords of Interest:
 Entities of Interest:
 {entities_of_interest}
 
-Generate up to 10 tags that best categorize this document and its relevance to the case. Include tags for relevant discovery goals, keywords found, and entities mentioned.
+Generate up to 15 tags that best categorize this document and its relevance to the case. If fewer than 15 tags are suitable, include only the most relevant tags that would be useful for the discovery goals. Include tags for relevant discovery goals, keywords found, and entities mentioned.
 
 Provide your tags in the following format:
-TAGS: [tag1], [tag2], [tag3], [tag4], [tag5], [tag6], [tag7], [tag8], [tag9], [tag10]
+TAGS: [tag1], [tag2], [tag3], [tag4], [tag5], [tag6], [tag7], [tag8], [tag9], [tag10], [tag11], [tag12], [tag13], [tag14], [tag15]
 """
 
 # Explanation Generation
 explanation_gen_prompt = """
-Provide a comprehensive explanation of why this document is important or relevant to the discovery goals.
+Provide a comprehensive explanation of why this document is important or relevant to the discovery goals. Be specific and provide examples to support your explanation if applicable.
 
 Discovery Goals:
 {discovery_goals}
@@ -815,7 +815,7 @@ EXPLANATION: [Your explanation here]
 
 # Importance Score Generation
 importance_score_prompt = """
-Based on all the information gathered about this document, generate sub-scores for different aspects of importance. Consider the following factors:
+Based on all the information gathered about this document, generate sub-scores for different aspects of importance to the discovery goals of the case. Consider the following factors:
 
 Document Information:
 {doc_info}
@@ -917,7 +917,8 @@ Format the section to be easily readable and scannable, using appropriate markdo
 
 [Your compiled markdown section here]
 """
-# GPU Check
+
+# GPU Check (for local LLM model inference)
 def is_gpu_available():
     if not GPU_AVAILABLE:
         logging.warning("GPU support not available: nvgpu module not found")
