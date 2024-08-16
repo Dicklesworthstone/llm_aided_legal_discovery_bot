@@ -105,7 +105,10 @@ def sophisticated_sentence_splitter(text: str) -> List[str]:
                 refined_sentences.append(temp_sentence.strip())
                 temp_sentence = ""
     if temp_sentence:
-        refined_sentences[-1] += temp_sentence
+        if refined_sentences:
+            refined_sentences[-1] += " " + temp_sentence.strip()
+        else:
+            refined_sentences.append(temp_sentence.strip())
     return [s.strip() for s in refined_sentences if s.strip()]
 
 async def parse_email_async(file_path: str) -> Dict[str, Any]:
@@ -631,7 +634,7 @@ async def process_document_ocr(list_of_extracted_text_strings: List[str], reform
         chunks[i] = " ".join(overlap_text) + " " + chunks[i]
     logging.info(f"OCR document split into {len(chunks):,} chunks. Chunk size: {chunk_size:,}, Overlap: {overlap:,}")
     # Concurrent processing of chunks
-    semaphore = asyncio.Semaphore(50)  # Limit concurrent processing to 50 chunks at a time
+    semaphore = asyncio.Semaphore(150)  # Limit concurrent processing to 150 chunks at a time
     async def process_chunk_wrapper(chunk: str, index: int) -> str:
         async with semaphore:
             try:
@@ -2138,16 +2141,10 @@ async def convert_documents_to_plaintext(original_source_dir: str, converted_sou
             md_file_path = os.path.join(converted_source_dir, f"{base_name}.md")
             # Check if converted file already exists
             if os.path.exists(txt_file_path) or os.path.exists(md_file_path):
-                existing_file = txt_file_path if os.path.exists(txt_file_path) else md_file_path
-                file_size = os.path.getsize(existing_file)
-                if file_size >= 1024:  # 1 KB
-                    logging.info(f"Skipping {os.path.basename(file_path)} - already converted ")
-                    pbar.set_postfix_str(f"Skipped {os.path.basename(file_path)} (already converted)")
-                    pbar.update(1)
-                    return
-                else:
-                    logging.warning(f"Deleting small converted file: {existing_file} ({file_size / 1024:.2f} KB)")
-                    os.remove(existing_file)
+                logging.info(f"Skipping {os.path.basename(file_path)} - already converted ")
+                pbar.set_postfix_str(f"Skipped {os.path.basename(file_path)} (already converted)")
+                pbar.update(1)
+                return
             try:
                 pbar.set_postfix_str(f"Processing {os.path.basename(file_path)}")
                 processed_text, mime_type, metadata, used_smart_ocr = await preprocess_document(file_path, converted_source_dir)
@@ -2172,18 +2169,20 @@ async def convert_documents_to_plaintext(original_source_dir: str, converted_sou
         tasks = [process_file(file_path, pbar) for file_path in files_to_convert]
         await asyncio.gather(*tasks)
     logging.info("Completed conversion of all documents to plaintext")
-    # Check for and remove tiny text files
-    removed_files = 0
-    for file_name in os.listdir(converted_source_dir):
-        file_path = os.path.join(converted_source_dir, file_name)
-        if file_name.endswith(('.txt', '.md')) and os.path.getsize(file_path) < 1024:  # Less than 1KB
-            logging.warning(f"Removing tiny converted file: {file_path}")
-            os.remove(file_path)
-            removed_files += 1
-    if removed_files > 0:
-        logging.info(f"Removed {removed_files} tiny converted files (less than 1KB)")
-    else:
-        logging.info("No tiny converted files found")
+    use_delete_tiny_files = 0
+    if use_delete_tiny_files:
+        # Check for and remove tiny text files
+        removed_files = 0
+        for file_name in os.listdir(converted_source_dir):
+            file_path = os.path.join(converted_source_dir, file_name)
+            if file_name.endswith(('.txt', '.md')) and os.path.getsize(file_path) < 1024:  # Less than 1KB
+                logging.warning(f"Removing tiny converted file: {file_path}")
+                os.remove(file_path)
+                removed_files += 1
+        if removed_files > 0:
+            logging.info(f"Removed {removed_files} tiny converted files (less than 1KB)")
+        else:
+            logging.info("No tiny converted files found")
     logging.info("Document conversion process completed")
     
 async def check_corrupted_output_file(file_path: str, original_file_path: str, max_retries: int = 3) -> dict:
@@ -2268,23 +2267,21 @@ USABILITY_SCORE: [0-100, where 0 is completely unusable and 100 is perfect]
         'explanation': 'Failed to analyze due to repeated errors, assuming not corrupted',
         'usability_score': 50  # Neutral score if analysis fails
     }
+    
 
 async def process_output_directory_to_check_for_corrupted_or_failed_files(output_dir: str, original_dir: str, max_concurrent: int = 5):
     logging.info(f"Starting to process directory: {output_dir}")
     semaphore = asyncio.Semaphore(max_concurrent)
     async def process_file(filename: str) -> Dict:
         async with semaphore:
+            if filename.startswith('email_bundle__'):
+                return None  # Skip email_bundle files
             output_file_path = os.path.join(output_dir, filename)
-            base_name = os.path.splitext(filename)[0]
-            # Try to find the original file with any extension
-            original_file_path = None
-            for ext in ['.pdf', '.txt', '.docx', '.doc', '.rtf', '.odt', '.pst', '.db', '.xlsx', '.xls', '.pptx', '.ppt', '.csv', '.html', '.htm', '.jpg', '.jpeg', '.png', '.tiff', '.bmp', '.gif', '']:
-                potential_path = os.path.join(original_dir, base_name + ext)
-                if os.path.exists(potential_path):
-                    original_file_path = potential_path
-                    break
+            base_name = os.path.splitext(filename)[0].lower()  # Normalize to lowercase
+            # Find the original file by matching base_name
+            original_file_path = next((os.path.join(original_dir, f) for f in os.listdir(original_dir) if os.path.splitext(f)[0].lower() == base_name), None)
             if not original_file_path:
-                logging.info(f"Original file not found for converted file: {filename}. This may be normal if not all files have been converted yet.")
+                logging.info(f"Original file not found for converted file: {filename}. This may be normal if not all files have been converted yet, or if there is not a 1:1 mapping between original and converted files (as in the case of email archives).")
                 return None
             try:
                 result = await check_corrupted_output_file(output_file_path, original_file_path)
@@ -2300,10 +2297,11 @@ async def process_output_directory_to_check_for_corrupted_or_failed_files(output
                     'usability_score': 0
                 }
     async def process_all_files() -> List[Dict]:
-        tasks = []
-        for filename in os.listdir(output_dir):
-            if filename.endswith(('.txt', '.md')):
-                tasks.append(asyncio.create_task(process_file(filename)))
+        tasks = [
+            asyncio.create_task(process_file(filename))
+            for filename in os.listdir(output_dir)
+            if filename.lower().endswith(('.txt', '.md'))  # Case-insensitive matching
+        ]
         return [result for result in await asyncio.gather(*tasks) if result is not None]
     try:
         all_results = await process_all_files()
@@ -2339,7 +2337,7 @@ async def process_output_directory_to_check_for_corrupted_or_failed_files(output
     except Exception as e:
         logging.error(f"An error occurred while processing the output directory: {str(e)}")
         return []
-
+    
 async def process_difficult_pdf_with_gpt4_vision(file_path: str) -> str:
     images = convert_pdf_to_images_ocr(file_path)
     all_text = []
@@ -2674,7 +2672,7 @@ async def determine_files_to_process(
     files_to_discover: Set[str] = set()
     processed_files_dir = os.path.join(discovery_output_dir, 'processed_files')
     os.makedirs(processed_files_dir, exist_ok=True)
-    semaphore = asyncio.Semaphore(100)  # Adjust this value based on your system's capabilities
+    semaphore = asyncio.Semaphore(1000)  # Adjust this value based on your system's capabilities
     async def check_file(file_path: str, is_original: bool, pbar: tqdm):
         async with semaphore:
             relative_path = os.path.relpath(file_path, original_source_dir if is_original else converted_source_dir)
@@ -3059,11 +3057,15 @@ async def main():
                 os.remove(file_path)
             else:
                 logging.warning(f"File not found, cannot delete: {file_path}")
+    else:
+        logging.info("Skipping deletion of corrupted or failed output files...")
     
     if USE_GPT4_VISION_MODEL_FOR_FAILED_OR_CORRUPTED_FILES:
         # Step 2b.1: Process corrupted/failed output files with GPT-4 Vision instead of pytesseract
         logging.info("Now processing corrupted or failed output files that did not work well with pytesseract with GPT-4 Vision... (more expensive but more capable with difficult files like handwritten documents)")
         await process_corrupted_files_with_gpt4_vision(LIKELY_CORRUPTED_OUTPUT_FILES_JSON_PATH)
+    else:
+        logging.info("Skipping processing of corrupted or failed output files with GPT-4 Vision...")
 
     # Step 2c: Process Enron email corpus, turning the archive into individual markdown files per sender if desired
     if use_enron_example:
