@@ -1317,11 +1317,16 @@ async def process_chunk_multi_stage(chunk, chunk_index, total_chunks, discovery_
     total_tokens = 0
     model_name = OPENAI_COMPLETION_MODEL if API_PROVIDER == "OPENAI" else CLAUDE_MODEL_STRING
 
-    async def call_api(prompt, max_tokens):
+    logging.info(f"Starting processing of chunk {chunk_index + 1}/{total_chunks}")
+
+    async def call_api(prompt, max_tokens, stage_name):
         nonlocal api_calls, total_tokens
         api_calls += 1
+        logging.info(f"Chunk {chunk_index + 1}/{total_chunks}: Calling API for {stage_name} (API call #{api_calls})")
         response = await generate_completion(prompt, max_tokens)
-        total_tokens += estimate_tokens(prompt, model_name) + estimate_tokens(response, model_name)
+        tokens_used = estimate_tokens(prompt, model_name) + estimate_tokens(response, model_name)
+        total_tokens += tokens_used
+        logging.info(f"Chunk {chunk_index + 1}/{total_chunks}: Completed {stage_name}. Tokens used: {tokens_used}")
         return response
 
     try:
@@ -1342,8 +1347,10 @@ async def process_chunk_multi_stage(chunk, chunk_index, total_chunks, discovery_
         explanation_tokens = min(1000, available_tokens - explanation_gen_prompt_tokens)
         importance_tokens = min(1000, available_tokens - importance_score_prompt_tokens)
 
+        logging.info(f"Chunk {chunk_index + 1}/{total_chunks}: Token allocations - Doc ID: {doc_id_tokens}, Relevance: {relevance_tokens}, Extract: {extract_tokens}, Tag: {tag_tokens}, Explanation: {explanation_tokens}, Importance: {importance_tokens}")
+
         # Stage 1: Document Identification
-        doc_info = await call_api(doc_id_prompt.format(document_excerpt=chunk, entities_of_interest=discovery_params['entities_of_interest']), doc_id_tokens)
+        doc_info = await call_api(doc_id_prompt.format(document_excerpt=chunk, entities_of_interest=discovery_params['entities_of_interest']), doc_id_tokens, "Document Identification")
 
         # Stage 2: Relevance Check
         relevance_analysis = await call_api(relevance_check_prompt.format(
@@ -1352,19 +1359,23 @@ async def process_chunk_multi_stage(chunk, chunk_index, total_chunks, discovery_
             document_excerpt=chunk,
             keywords=discovery_params['keywords'],
             entities_of_interest=discovery_params['entities_of_interest']
-        ), relevance_tokens)
+        ), relevance_tokens, "Relevance Check")
 
         if 'RELEVANT: No' in relevance_analysis:
+            logging.info(f"Chunk {chunk_index + 1}/{total_chunks}: Deemed not relevant. Skipping further processing.")
             return None, api_calls, total_tokens
 
+        logging.info(f"Chunk {chunk_index + 1}/{total_chunks}: Deemed relevant. Proceeding with further analysis.")
+
         # Parallel processing stages
+        logging.info(f"Chunk {chunk_index + 1}/{total_chunks}: Starting parallel processing of Extract Generation and Tag Generation")
         extract_task = asyncio.create_task(call_api(extract_gen_prompt.format(
             relevance_analysis=relevance_analysis,
             full_document_text=chunk,
             discovery_goals=discovery_params['discovery_goals'],
             keywords=discovery_params['keywords'],
             entities_of_interest=discovery_params['entities_of_interest']
-        ), extract_tokens))
+        ), extract_tokens, "Extract Generation"))
 
         tag_task = asyncio.create_task(call_api(tag_gen_prompt.format(
             doc_info=doc_info,
@@ -1372,9 +1383,10 @@ async def process_chunk_multi_stage(chunk, chunk_index, total_chunks, discovery_
             discovery_goals=discovery_params['discovery_goals'],
             keywords=discovery_params['keywords'],
             entities_of_interest=discovery_params['entities_of_interest']
-        ), tag_tokens))
+        ), tag_tokens, "Tag Generation"))
 
         key_extracts, tags = await asyncio.gather(extract_task, tag_task)
+        logging.info(f"Chunk {chunk_index + 1}/{total_chunks}: Completed parallel processing of Extract Generation and Tag Generation")
 
         # Sequential stages
         explanation = await call_api(explanation_gen_prompt.format(
@@ -1384,7 +1396,7 @@ async def process_chunk_multi_stage(chunk, chunk_index, total_chunks, discovery_
             relevance_analysis=relevance_analysis,
             keywords=discovery_params['keywords'],
             entities_of_interest=discovery_params['entities_of_interest']
-        ), explanation_tokens)
+        ), explanation_tokens, "Explanation Generation")
 
         importance_analysis = await call_api(importance_score_prompt.format(
             doc_info=doc_info,
@@ -1395,9 +1407,10 @@ async def process_chunk_multi_stage(chunk, chunk_index, total_chunks, discovery_
             discovery_goals=discovery_params['discovery_goals'],
             keywords_found=discovery_params['keywords'],
             entities_mentioned=discovery_params['entities_of_interest']
-        ), importance_tokens)
+        ), importance_tokens, "Importance Score Analysis")
 
         importance_score = calculate_importance_score(importance_analysis)
+        logging.info(f"Chunk {chunk_index + 1}/{total_chunks}: Calculated importance score: {importance_score['final_score']:.2f}")
 
         chunk_package = {
             "chunk_index": chunk_index,
@@ -1412,9 +1425,10 @@ async def process_chunk_multi_stage(chunk, chunk_index, total_chunks, discovery_
             "total_tokens": total_tokens,
             "chunk_text": chunk
         }
+        logging.info(f"Chunk {chunk_index + 1}/{total_chunks}: Processing complete. API calls: {api_calls}, Total tokens used: {total_tokens}")
         return chunk_package, api_calls, total_tokens
     except Exception as e:
-        logging.error(f"Error processing chunk {chunk_index}/{total_chunks}: {str(e)}")
+        logging.error(f"Error processing chunk {chunk_index + 1}/{total_chunks}: {str(e)}")
         return None, api_calls, total_tokens
 
 def compile_dossier_section(processed_chunks: List[Dict[str, Any]], document_id: str, file_path: str, discovery_params: Dict[str, Any]) -> Dict[str, Any]:
@@ -2590,7 +2604,7 @@ async def determine_files_to_process(
     return list(files_to_convert), list(files_to_discover)
 
 async def process_document_async(file_path: str, converted_source_dir: str, discovery_params: Dict[str, Any], discovery_output_dir: str, semaphore: asyncio.Semaphore, model_name: str, max_chunk_tokens: int):
-    logging.info(f"Processing file: {file_path}")
+    logging.info(f"Starting processing of file: {file_path}")
     start_time = time.time()
     total_api_calls = 0
     total_tokens_used = 0
@@ -2611,9 +2625,11 @@ async def process_document_async(file_path: str, converted_source_dir: str, disc
             'file_size_bytes': os.path.getsize(file_path)
         }
     }
+    logging.info(f"File {file_path}: Detected MIME type: {detected_mime_type}, Size: {result['metadata']['file_size_bytes']} bytes")
     # Save initial result
     with open(json_output_path, 'w') as f:
         json.dump(result, f, indent=2)
+    logging.info(f"File {file_path}: Initial result saved to {json_output_path}")
     try:
         processed_text, _, metadata, _ = await preprocess_document(file_path, converted_source_dir)
         sentences = sophisticated_sentence_splitter(processed_text)
@@ -2621,22 +2637,27 @@ async def process_document_async(file_path: str, converted_source_dir: str, disc
         result['metadata']['thousands_of_input_words'] = round(sum(len(s.split()) for s in sentences) / 1000, 2)
         if metadata:
             result['metadata'].update(metadata)
+        logging.info(f"File {file_path}: Preprocessed. Total sentences: {result['metadata']['total_sentences']}, Estimated words: {result['metadata']['thousands_of_input_words']}K")
         # Update result file with metadata
         with open(json_output_path, 'w') as f:
             json.dump(result, f, indent=2)
         chunk_size = 10
         chunks = [sentences[i:i + chunk_size] for i in range(0, len(sentences), chunk_size)]
+        logging.info(f"File {file_path}: Split into {len(chunks)} chunks for processing")
         async def process_chunk(chunk, i):
             async with semaphore:
                 chunk_text = " ".join(chunk)
+                logging.info(f"File {file_path}: Processing chunk {i+1}/{len(chunks)}")
                 chunk_result, api_calls, tokens_used = await process_chunk_multi_stage(chunk_text, i, len(chunks), discovery_params)
                 if chunk_result:
                     importance_score = float(chunk_result['importance_score']['final_score'])
                     if importance_score >= discovery_params['minimum_importance_score']:
                         result['processed_chunks'].append(chunk_result)
+                        logging.info(f"File {file_path}: Chunk {i+1}/{len(chunks)} added to high-importance chunks. Score: {importance_score:.2f}")
                     else:
                         result['low_importance_chunks'].append(chunk_result)
-                    logging.info(f"Processed chunk {i+1}/{len(chunks)} for document {file_path}; importance score: {importance_score:.2f}; total chunks processed: {len(result['processed_chunks'])}")
+                        logging.info(f"File {file_path}: Chunk {i+1}/{len(chunks)} added to low-importance chunks. Score: {importance_score:.2f}")
+                    logging.info(f"File {file_path}: Processed chunk {i+1}/{len(chunks)}. Importance score: {importance_score:.2f}. Total high-importance chunks: {len(result['processed_chunks'])}, Total low-importance chunks: {len(result['low_importance_chunks'])}")
                     # Update result file after each chunk
                     with open(json_output_path, 'w') as f:
                         json.dump(result, f, indent=2)
@@ -2648,14 +2669,17 @@ async def process_document_async(file_path: str, converted_source_dir: str, disc
             if chunk_result:
                 total_api_calls += api_calls
                 total_tokens_used += tokens_used
+        logging.info(f"File {file_path}: All chunks processed. Total API calls: {total_api_calls}, Total tokens used: {total_tokens_used}")
         if not result['processed_chunks'] and not result['low_importance_chunks']:
-            logging.info(f"Document {file_path} did not yield any relevant information.")
+            logging.info(f"File {file_path}: Did not yield any relevant information.")
             return None
+        logging.info(f"File {file_path}: Compiling dossier sections")
         dossier_section = compile_dossier_section(result['processed_chunks'], document_id, file_path, discovery_params)
         low_importance_section = compile_dossier_section(result['low_importance_chunks'], document_id, file_path, discovery_params)
         result['dossier_section'] = dossier_section['dossier_section'] if dossier_section else None
         result['importance_score'] = dossier_section['importance_score'] if dossier_section else 0
         result['low_importance_section'] = low_importance_section['dossier_section'] if low_importance_section else None
+        logging.info(f"File {file_path}: Dossier sections compiled. Overall importance score: {result['importance_score']:.2f}")
         end_time = time.time()
         result['processing_time_seconds'] = end_time - start_time
         result['total_api_calls'] = total_api_calls
@@ -2663,6 +2687,7 @@ async def process_document_async(file_path: str, converted_source_dir: str, disc
         # Save final result
         with open(json_output_path, 'w') as f:
             json.dump(result, f, indent=2)
+        logging.info(f"File {file_path}: Final result saved to {json_output_path}")
         # Generate document-level dossier
         dossier_file_name = f"document_level_dossier__{os.path.splitext(os.path.basename(file_path))[0]}.md"
         dossier_file_path = os.path.join(discovery_output_dir, dossier_file_name)
@@ -2672,7 +2697,8 @@ async def process_document_async(file_path: str, converted_source_dir: str, disc
             if result['low_importance_section']:
                 f.write("\n\n## Low Importance Section\n\n")
                 f.write(result['low_importance_section'])
-        logging.info(f"Processed {file_path} in {result['processing_time_seconds']:.2f} seconds. "
+        logging.info(f"File {file_path}: Document-level dossier generated and saved to {dossier_file_path}")
+        logging.info(f"File {file_path}: Processing completed in {result['processing_time_seconds']:.2f} seconds. "
                         f"API calls: {total_api_calls}, Tokens used: {total_tokens_used}, "
                         f"Importance score: {result['importance_score']:.2f}")
         return result
@@ -2683,6 +2709,7 @@ async def process_document_async(file_path: str, converted_source_dir: str, disc
 
 def compile_results(file_path: str, discovery_params: Dict[str, Any]) -> Dict[str, Any]:
     json_output_path = file_path.replace('.txt', '_discovery_results.json').replace('.md', '_discovery_results.json')
+    logging.info(f"Compiling results for file: {file_path}")
     if not os.path.exists(json_output_path):
         logging.error(f"Results file not found for {file_path}")
         return None
@@ -2697,12 +2724,13 @@ def compile_results(file_path: str, discovery_params: Dict[str, Any]) -> Dict[st
         'processed_chunks': document_results['processed_chunks'],
         'metadata': {
             'file_path': file_path,
-            'total_chunks': document_results['total_chunks'],
+            'total_chunks': len(document_results['processed_chunks']),
             'total_api_calls': document_results['total_api_calls'],
             'total_tokens_used': document_results['total_tokens_used'],
             'processing_time_seconds': document_results.get('processing_time_seconds', 0)
         }
     }
+    logging.info(f"File {file_path}: Loaded {compiled_result['metadata']['total_chunks']} processed chunks")
     # Combine dossier sections and calculate overall importance score
     high_importance_chunks = []
     low_importance_chunks = []
@@ -2711,11 +2739,22 @@ def compile_results(file_path: str, discovery_params: Dict[str, Any]) -> Dict[st
             high_importance_chunks.append(chunk_result)
         else:
             low_importance_chunks.append(chunk_result)
-    compiled_result['importance_score'] = sum(chunk['importance_score']['final_score'] for chunk in document_results['processed_chunks']) / len(document_results['processed_chunks'])
+    logging.info(f"File {file_path}: Identified {len(high_importance_chunks)} high-importance chunks and {len(low_importance_chunks)} low-importance chunks")
+    if document_results['processed_chunks']:
+        compiled_result['importance_score'] = sum(chunk['importance_score']['final_score'] for chunk in document_results['processed_chunks']) / len(document_results['processed_chunks'])
+        logging.info(f"File {file_path}: Calculated overall importance score: {compiled_result['importance_score']:.2f}")
+    else:
+        logging.warning(f"File {file_path}: No processed chunks found, importance score set to 0")
     if high_importance_chunks:
-        compiled_result['dossier_section'] = compile_dossier_section(high_importance_chunks, compiled_result['document_id'], file_path, discovery_params)
+        compiled_result['dossier_section'] = compile_dossier_section(high_importance_chunks, compiled_result['document_id'], file_path, discovery_params)['dossier_section']
+        logging.info(f"File {file_path}: Compiled high-importance dossier section")
+    else:
+        logging.info(f"File {file_path}: No high-importance chunks to compile")
     if low_importance_chunks:
-        compiled_result['low_importance_section'] = compile_dossier_section(low_importance_chunks, compiled_result['document_id'], file_path, discovery_params)
+        compiled_result['low_importance_section'] = compile_dossier_section(low_importance_chunks, compiled_result['document_id'], file_path, discovery_params)['dossier_section']
+        logging.info(f"File {file_path}: Compiled low-importance dossier section")
+    else:
+        logging.info(f"File {file_path}: No low-importance chunks to compile")
     # Save document-level dossier
     dossier_file_name = f"document_level_dossier__{os.path.splitext(os.path.basename(file_path))[0]}.md"
     dossier_file_path = os.path.join(os.path.dirname(json_output_path), dossier_file_name)
@@ -2724,6 +2763,11 @@ def compile_results(file_path: str, discovery_params: Dict[str, Any]) -> Dict[st
         if compiled_result['low_importance_section']:
             f.write("\n\n## Low Importance Section\n\n")
             f.write(compiled_result['low_importance_section'])
+    logging.info(f"File {file_path}: Saved document-level dossier to {dossier_file_path}")
+    logging.info(f"File {file_path}: Compilation complete. Total chunks: {compiled_result['metadata']['total_chunks']}, "
+                    f"API calls: {compiled_result['metadata']['total_api_calls']}, "
+                    f"Tokens used: {compiled_result['metadata']['total_tokens_used']}, "
+                    f"Processing time: {compiled_result['metadata']['processing_time_seconds']:.2f} seconds")
     return compiled_result
 
 def process_document_wrapper_mp(file_path, converted_source_dir, discovery_params, discovery_output_dir, semaphore, model_name, max_chunk_tokens):
@@ -2739,13 +2783,15 @@ def process_document_wrapper_mp(file_path, converted_source_dir, discovery_param
 #############################################################################################################################    
     
 # Static configuration
-MAX_SOURCE_DOCUMENTS_TO_CONVERT_TO_PLAINTEXT_AT_ONE_TIME = 5
+MAX_SOURCE_DOCUMENTS_TO_CONVERT_TO_PLAINTEXT_AT_ONE_TIME = 15
 USE_GPT4_VISION_MODEL_FOR_FAILED_OR_CORRUPTED_FILES = 0
 USE_OVERRIDE_DISCOVERY_CONFIG_JSON_FILE = 1  # Set to 1 to use override file
 OVERRIDE_CONFIG_FILE_PATH = "discovery_configuration_json_files/shareholders_vs_enron_corporation.json"
 MINIMUM_OCR_USABILITY_SCORE = 20 # Below this threshold, the document will be considered corrupted
 LIKELY_CORRUPTED_OUTPUT_FILES_JSON_PATH = 'likely_corrupted_output_files.json'
 LIST_OF_NON_CORRUPTED_FILES_PATH = "converted_output_files_already_checked_for_corruption_that_were_not_corrupted.json"
+
+# This is just a simple example of a free-form text goal input; this will be overwritten with the Enron-specific input if use_enron_example is set to 1
 USER_FREEFORM_TEXT_GOAL_INPUT = """
 We're working on a case involving patent infringement by TechCorp against our client, InnovativeTech. 
 We need to find any communications or documents that discuss TechCorp's knowledge of our client's patent 
@@ -2934,12 +2980,17 @@ async def main():
             converted_source_dir
         )          
             
-    # Step 2d: Create and populate a SQLite database for the discovery case
-    logging.info("Creating and populating SQLite database containing converted documents and their metadata...")
-    create_and_populate_case_sqlite_database(config_file_path, converted_source_dir, original_source_dir, discovery_output_dir)
+    use_create_sqlite_database = 0
+    if use_create_sqlite_database:
+        # Step 2d: Create and populate a SQLite database for the discovery case
+        logging.info("Creating and populating SQLite database containing converted documents and their metadata...")
+        create_and_populate_case_sqlite_database(config_file_path, converted_source_dir, original_source_dir, discovery_output_dir)
+    else:
+        logging.info("Skipping creation of SQLite database...")
     
     # Create a semaphore to limit concurrent API calls
-    semaphore = asyncio.Semaphore(20)  # Adjust this value based on API rate limits
+    MAX_CONCURRENT_CONVERTED_DOCUMENTS_TO_PROCESS_FOR_DISCOVERY = 1  # Adjust this value based on API rate limits
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_CONVERTED_DOCUMENTS_TO_PROCESS_FOR_DISCOVERY)
 
     # Step 3: Process converted documents
     logging.info("\n________________________________________________________________________________\n\nNow performing automated legal discovery on converted documents!!")
@@ -2973,7 +3024,7 @@ async def main():
                     results.append(result)
                 pbar.update()
 
-    # Compile dossiers from saved JSON files
+    # Compile complete case level dossiers from saved JSON files
     dossier_sections = []
     low_importance_sections = []
     results_dir = os.path.join(discovery_output_dir, 'results')
